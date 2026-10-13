@@ -13,8 +13,8 @@
 // @connect      pollinations.ai
 // @connect      gen.pollinations.ai
 // @connect      *
-// @updateURL    https://raw.githubusercontent.com/THE-LAZYBONE/ai-solver/main/ai-solver.user.js
-// @downloadURL  https://raw.githubusercontent.com/THE-LAZYBONE/ai-solver/main/ai-solver.user.js
+// @updateURL    https://raw.githubusercontent.com/memaygayy/QuG6ok8gR0FZ/main/ai-solver.user.js
+// @downloadURL  https://raw.githubusercontent.com/memaygayy/QuG6ok8gR0FZ/main/ai-solver.user.js
 // ==/UserScript==
 
 /* =====================================================================
