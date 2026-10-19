@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         AI Solver v38.5
+// @name         AI Solver v38.6
 // @namespace    https://github.com/memaygayy/QuG6ok8gR0FZ
-// @version      38.5.0
-// @description  Auto solve onluyen.vn — fetch-first, DeepSeek V4 Flash default
+// @version      38.6.0
+// @description  Auto solve onluyen.vn — không tự nộp bài, chờ câu load, kiểm tra đáp án
 // @author       memaygayy
 // @match        https://*.onluyen.vn/*
 // @grant        GM_xmlhttpRequest
@@ -21,32 +21,42 @@
   window.__AI_SOLVER_V38__ = true;
 
   /* ================= CONFIG ================= */
-  const VERSION        = "38.5.0";
-  const GUI_ID         = "ai-solver-v38";
-  const PROXY_URL      = "https://gen.pollinations.ai/v1/chat/completions";
-  const POLL_KEY       = "sk_D8PP0K4jFUDUa0zjrx7uxq1XM1ZoVINK";
+  const VERSION   = "38.6.0";
+  const GUI_ID    = "ai-solver-v38";
+  const PROXY_URL = "https://gen.pollinations.ai/v1/chat/completions";
+  const POLL_KEY  = "sk_D8PP0K4jFUDUa0zjrx7uxq1XM1ZoVINK";
 
   const MODEL_KEY        = "HW_SOLVER_MODEL_V2";
   const MODEL_CUSTOM_KEY = "HW_SOLVER_MODEL_CUSTOM";
+  const MODEL_WORKING    = "HW_SOLVER_MODEL_WORKING";
   const INTERVAL_KEY     = "HW_SOLVER_INTERVAL";
   const RESOLVE_KEY      = "HW_SOLVER_RE_SOLVE_DONE";
+  const AUTOSUBMIT_KEY   = "HW_SOLVER_AUTO_SUBMIT";
 
-  const DEFAULT_MODEL   = "deepseek/deepseek-v4-flash";
-  const FALLBACK_MODELS = ["deepseek", "gemini"];
-  const MODEL_CHOICES   = ["deepseek/deepseek-v4-flash", "deepseek", "gemini", "openai", "claude"];
+  const DEFAULT_MODEL    = "deepseek/deepseek-v4-flash";
+  const FALLBACK_MODELS  = ["deepseek", "gemini", "openai"];
+  const MODEL_CHOICES    = ["deepseek/deepseek-v4-flash", "deepseek", "gemini", "openai", "claude"];
 
+  const MAX_OPTIONS      = 12;
   const RE_CHECK_ROUNDS  = 3;
   const MAX_ANSWER_RETRY = 2;
   const API_TIMEOUT      = 35000;
-  const NEXT_WAIT        = 7000;
+  const NEXT_WAIT        = 8000;
+  const QUESTION_WAIT_MS = 15000;
 
   /* ================= STATE ================= */
-  const state = { running:false, busy:false, lastSig:"", sameSigCount:0, cache:new Map(), timers:[] };
-  let TRANSPORT = null; // "fetch" | "gm" | null
+  const state = {
+    running: false, busy: false,
+    lastSig: "", sameSigCount: 0,
+    cache: new Map(), solvedSigs: new Set(),
+    timers: [], advanceFail: 0, answered: 0, idleTicks: 0
+  };
+  let TRANSPORT = null;
 
   /* ================= GETTERS ================= */
   function getInterval()    { const v = parseInt(localStorage.getItem(INTERVAL_KEY), 10); return (isNaN(v) || v < 1200) ? 3500 : v; }
   function getReSolveDone() { return localStorage.getItem(RESOLVE_KEY) !== "false"; }
+  function getAutoSubmit()  { return localStorage.getItem(AUTOSUBMIT_KEY) === "true"; }
   function getModel() {
     const custom = (localStorage.getItem(MODEL_CUSTOM_KEY) || "").trim();
     if (custom) return custom;
@@ -66,7 +76,7 @@
     return true;
   }
 
-  function insideGui(el) { const gui = document.getElementById(GUI_ID); return !!(gui && el && gui.contains(el)); }
+  function insideGui(el) { const g = document.getElementById(GUI_ID); return !!(g && el && g.contains(el)); }
   function hashStr(s) { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36); }
   function cleanText(el) { return (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim(); }
 
@@ -85,7 +95,7 @@
     try { el.scrollIntoView({ block: "center" }); } catch (e) {}
     try { el.click(); return true; } catch (e) {}
     try {
-      const o = { bubbles:true, cancelable:true, view:window };
+      const o = { bubbles: true, cancelable: true, view: window };
       el.dispatchEvent(new MouseEvent("mousedown", o));
       el.dispatchEvent(new MouseEvent("mouseup", o));
       el.dispatchEvent(new MouseEvent("click", o));
@@ -95,36 +105,35 @@
 
   function setNativeChecked(input, val) {
     try {
-      const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked");
-      if (desc && desc.set) desc.set.call(input, val); else input.checked = val;
+      const d = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked");
+      if (d && d.set) d.set.call(input, val); else input.checked = val;
     } catch (e) { try { input.checked = val; } catch (e2) {} }
   }
 
   function setNativeValue(el, value) {
     const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    const desc = Object.getOwnPropertyDescriptor(proto, "value");
-    if (desc && desc.set) desc.set.call(el, value); else el.value = value;
-    el.dispatchEvent(new Event("input", { bubbles:true }));
-    el.dispatchEvent(new Event("change", { bubbles:true }));
+    const d = Object.getOwnPropertyDescriptor(proto, "value");
+    if (d && d.set) d.set.call(el, value); else el.value = value;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
-  /* ============ TRANSPORT (fetch-first, GM fallback) ============ */
+  /* ================= TRANSPORT ================= */
   async function fetchJSON(opts) {
     const ctrl = new AbortController();
     const ms = opts.timeout || API_TIMEOUT;
     const t = setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, ms);
     try {
       const res = await fetch(opts.url, {
-        method:      opts.method || "GET",
-        headers:     opts.headers || {},
-        body:        opts.data,
-        signal:      ctrl.signal,
-        mode:        "cors",
+        method: opts.method || "GET",
+        headers: opts.headers || {},
+        body: opts.data,
+        signal: ctrl.signal,
+        mode: "cors",
         credentials: "omit",
-        cache:       "no-store"
+        cache: "no-store"
       });
-      const text = await res.text();
-      return { status: res.status, responseText: text };
+      return { status: res.status, responseText: await res.text() };
     } finally { clearTimeout(t); }
   }
 
@@ -154,7 +163,7 @@
       if (TRANSPORT !== "fetch") { TRANSPORT = "fetch"; log("Transport = fetch (OK)", "ok"); }
       return r;
     } catch (e) {
-      if (TRANSPORT === "fetch") { log("fetch lỗi giữa chừng: " + e.message, "warn"); throw e; }
+      if (TRANSPORT === "fetch") throw e;
       log("fetch thất bại (" + e.message + ") → GM_xmlhttpRequest", "warn");
       const r = await gmJSON(opts);
       TRANSPORT = "gm";
@@ -163,124 +172,236 @@
     }
   }
 
-  async function askAI(messages, model) {
-    const body = { model, messages, temperature:0.2, max_tokens:900, private:true };
+  /* ================= API ================= */
+  async function askAIOnce(messages, model) {
+    const body = { model: model, messages: messages, temperature: 0.2, max_tokens: 900, private: true };
     const res = await request({
       method: "POST",
-      url:    PROXY_URL,
-      headers:{ "Content-Type":"application/json", "Authorization":"Bearer " + POLL_KEY },
-      data:   JSON.stringify(body),
-      timeout:API_TIMEOUT
+      url: PROXY_URL,
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + POLL_KEY },
+      data: JSON.stringify(body),
+      timeout: API_TIMEOUT
     });
-    if (res.status !== 200) throw new Error("HTTP " + res.status + " " + (res.responseText || "").slice(0, 120));
+    if (res.status !== 200) {
+      throw new Error("HTTP " + res.status + " " + (res.responseText || "").slice(0, 140).replace(/\s+/g, " "));
+    }
     let json;
-    try { json = JSON.parse(res.responseText); } catch (e) { throw new Error("bad json"); }
-    const content = json && json.choices && json.choices[0] && json.choices[0].message && json.choices[0].message.content;
-    if (!content) throw new Error("empty response");
-    return content;
+    try { json = JSON.parse(res.responseText); }
+    catch (e) { throw new Error("bad json: " + (res.responseText || "").slice(0, 120)); }
+    if (json && json.error) throw new Error("API: " + String(json.error).slice(0, 120));
+    const c = json && json.choices && json.choices[0] && json.choices[0].message && json.choices[0].message.content;
+    if (!c || !String(c).trim()) throw new Error("empty response");
+    return String(c);
+  }
+
+  async function askAI(messages, model) {
+    try { return await askAIOnce(messages, model); }
+    catch (e) {
+      if (/empty response/.test(e.message)) { await sleep(700); return await askAIOnce(messages, model); }
+      throw e;
+    }
   }
 
   async function askWithFallback(messages, model) {
-    const queue = [model].concat(FALLBACK_MODELS.filter(m => m !== model));
+    const working = (localStorage.getItem(MODEL_WORKING) || "").trim();
+    const queue = [];
+    if (working) queue.push(working);
+    [model].concat(FALLBACK_MODELS).forEach(m => { if (m && queue.indexOf(m) < 0) queue.push(m); });
+
     let lastErr = null;
     for (let i = 0; i < queue.length; i++) {
       const m = queue[i];
       try {
         const text = await askAI(messages, m);
-        if (i > 0) log("Fallback → " + m, "warn");
+        if (m !== working) {
+          localStorage.setItem(MODEL_WORKING, m);
+          log("Model dùng được: " + m + " (áp dụng các câu sau)", "ok");
+        }
         return text;
       } catch (e) {
         lastErr = e;
         log("Model " + m + " lỗi: " + e.message, "warn");
-        const fatal = !/not found|404|unsupported|invalid model|empty|bad json/i.test(e.message);
-        if (fatal) break;
+        if (working && m === working) localStorage.removeItem(MODEL_WORKING);
+        const modelIssue = /not found|404|unsupported|invalid model|empty|bad json|400|401|403|429/i.test(e.message);
+        if (!modelIssue) break;   // network timeout → dừng, không thử model khác
       }
     }
     throw lastErr || new Error("API failed");
   }
 
-  /* ============ PROMPT ============ */
+  /* ================= PROMPT + PARSE ================= */
   function buildMessages(stem, optTexts, prevWrong) {
     const letters = optTexts.map((_, i) => String.fromCharCode(65 + i));
     const list = optTexts.map((t, i) => letters[i] + ". " + t).join("\n");
     const sys = [
       "Bạn là trợ lý giải bài tập trắc nghiệm.",
-      "Chọn đáp án đúng nhất cho câu hỏi.",
+      "Đọc kỹ câu hỏi và chọn đáp án đúng nhất.",
+      "Nếu câu hỏi có thể có nhiều đáp án đúng, liệt kê tất cả.",
       "Trả lời ĐÚNG định dạng, không thêm gì khác:",
       "ĐÁP ÁN: <chữ cái, nhiều đáp án cách nhau dấu phẩy>",
       "GIẢI THÍCH: <1-2 câu ngắn gọn>"
     ].join("\n");
+
     let user = "Câu hỏi:\n" + stem + "\n\nCác lựa chọn:\n" + list + "\n\nChọn đáp án đúng.";
-    if (prevWrong && prevWrong.length) user += "\n\nLƯU Ý: đáp án " + prevWrong.join(", ") + " đã bị SAI. Bắt buộc chọn đáp án KHÁC.";
-    return [{ role:"system", content:sys }, { role:"user", content:user }];
+    if (prevWrong && prevWrong.length) {
+      user += "\n\nLƯU Ý: đáp án " + prevWrong.join(", ") + " đã bị SAI. Bắt buộc chọn đáp án KHÁC.";
+    }
+    return [{ role: "system", content: sys }, { role: "user", content: user }];
   }
 
   function parseAnswer(text, count) {
     const out = new Set();
+    const s = String(text);
     let seg = "";
-    const m = String(text).match(/ĐÁP\s*ÁN\s*[:：]/i);
-    if (m) seg = text.slice(m.index + m[0].length).split("\n")[0];
-    else seg = String(text).split("\n").find(l => /[A-F]/.test(l)) || String(text);
+    const m = s.match(/ĐÁP\s*ÁN\s*[:：]/i);
+    if (m) seg = s.slice(m.index + m[0].length).split("\n")[0];
+    else seg = s.split("\n").find(l => /[A-F]/.test(l)) || s;
+
     (seg.toUpperCase().match(/\b[A-F]\b/g) || []).forEach(ch => {
       const i = ch.charCodeAt(0) - 65;
       if (i >= 0 && i < count) out.add(i);
     });
+
     if (!out.size) {
-      (String(text).toUpperCase().match(/(?:^|[\s:.,(])([A-F])(?=[\s.,)\n]|$)/g) || []).forEach(tok => {
+      (s.toUpperCase().match(/(?:^|[\s:.,(])([A-F])(?=[\s.,)\n]|$)/g) || []).forEach(tok => {
         const ch = tok.trim().replace(/[^A-F]/g, "");
         if (ch.length === 1) { const i = ch.charCodeAt(0) - 65; if (i >= 0 && i < count) out.add(i); }
+      });
+    }
+
+    if (!out.size && m) {
+      (seg.match(/\b(\d{1,2})\b/g) || []).forEach(n => {
+        const i = parseInt(n, 10) - 1;
+        if (i >= 0 && i < count) out.add(i);
       });
     }
     return Array.from(out).sort((a, b) => a - b);
   }
 
-  /* ============ DOM ============ */
+  /* ================= DOM DETECTION ================= */
   const OPTION_SELECTORS = [
     ".answer-item", ".answers .item", ".list-answer .item", ".answer-list .item",
     ".option-item", ".choices .item", ".choice-item",
     ".question-item .answer", ".question .answer", ".answer", ".option"
   ];
-  const SUBMIT_RE = /(nộp|kiểm tra|submit|check|hoàn thành|xác nhận)/i;
+  const SUBMIT_RE = /(nộp bài|nộp|kiểm tra|submit|check|hoàn thành|xác nhận)/i;
   const NEXT_RE   = /(câu tiếp|tiếp theo|câu sau|next|tiếp|sau)/i;
+  const FINAL_RE  = /(nộp bài|hoàn thành|xác nhận nộp|kết thúc)/i;
 
   function isButtonLike(n) {
     const t = cleanText(n).toLowerCase();
     return /^(nộp bài|nộp|kiểm tra|tiếp|câu tiếp|câu tiếp theo|next|submit|start|stop|gửi)$/.test(t);
   }
 
+  /* --- loại bộ "đáp án giả" (thanh số câu 1..40) --- */
+  function looksLikeNavigator(nodes) {
+    if (!nodes || nodes.length > MAX_OPTIONS) return true;
+    const texts = nodes.map(cleanText);
+    if (!texts.length) return true;
+    const numeric = texts.filter(t => /^\d{1,3}$/.test(t)).length;
+    if (texts.length > 6 && numeric / texts.length > 0.6) return true;
+    return false;
+  }
+
+  function optionSetScore(nodes) {
+    if (!nodes || nodes.length < 2 || nodes.length > MAX_OPTIONS) return -1;
+    if (looksLikeNavigator(nodes)) return -1;
+    const texts = nodes.map(cleanText).filter(t => t.length);
+    if (texts.length < 2) return -1;
+    let score = 0;
+    if (texts.some(t => t.length >= 8)) score += 3;
+    if (nodes.some(n => n.querySelector && n.querySelector('input[type="radio"], input[type="checkbox"]'))) score += 3;
+    const cls = (typeof nodes[0].className === "string" ? nodes[0].className : "").toLowerCase();
+    if (/answer|choice|option|select/.test(cls)) score += 2;
+    score += Math.min(texts.length, 6);
+    return score;
+  }
+
   function getOptionNodes() {
-    let best = [];
+    const candidates = [];
+
     for (let s = 0; s < OPTION_SELECTORS.length; s++) {
       let nodes = [];
       try { nodes = Array.from(document.querySelectorAll(OPTION_SELECTORS[s])); } catch (e) { continue; }
       nodes = nodes.filter(n => !insideGui(n) && isVisible(n) && !isButtonLike(n));
-      if (!nodes.length) continue;
-      const innermost = nodes.filter(n => !nodes.some(m => m !== n && n.contains(m)));
-      if (innermost.length >= 2) { best = innermost; break; }
+      if (nodes.length < 2) continue;
+      const inner = nodes.filter(n => !nodes.some(m => m !== n && n.contains(m)));
+      if (inner.length >= 2) candidates.push(inner);
     }
-    return best;
+
+    const radios = Array.from(document.querySelectorAll('input[type="radio"], input[type="checkbox"]'))
+      .filter(r => !insideGui(r) && r.name && !r.disabled && isVisible(r));
+    if (radios.length >= 2) {
+      const groups = {};
+      radios.forEach(r => { (groups[r.name] = groups[r.name] || []).push(r); });
+      Object.keys(groups).forEach(k => {
+        const g = groups[k];
+        if (g.length >= 2 && g.length <= MAX_OPTIONS) {
+          const wrapped = g.map(r => r.closest("label") || r.parentElement).filter(Boolean);
+          const uniq = wrapped.filter((n, i) => wrapped.indexOf(n) === i);
+          if (uniq.length >= 2) candidates.push(uniq);
+        }
+      });
+    }
+
+    let best = null, bestScore = -1;
+    for (let i = 0; i < candidates.length; i++) {
+      const sc = optionSetScore(candidates[i]);
+      if (sc > bestScore) { bestScore = sc; best = candidates[i]; }
+    }
+    return bestScore > 0 ? best : [];
+  }
+
+  function extractLeafStem(root, options) {
+    const parts = [];
+    function walk(node) {
+      if (!node || node.nodeType !== 1) return;
+      if (insideGui(node)) return;
+      for (let i = 0; i < options.length; i++) if (options[i] === node || options[i].contains(node)) return;
+      const kids = Array.from(node.children);
+      if (!kids.length) {
+        const t = cleanText(node);
+        if (t && t.length >= 4 && !/^[\d\s.,/:\-]+$/.test(t)) parts.push(t);
+        return;
+      }
+      kids.forEach(walk);
+    }
+    walk(root);
+    let out = "";
+    for (let i = 0; i < parts.length && out.length < 1200; i++) out += (out ? " " : "") + parts[i];
+    return out.trim();
   }
 
   function getStem(options) {
     if (!options || !options.length) return "";
+    const optTexts = options.map(cleanText).filter(t => t.length);
+
     let anc = options[0], guard = 0;
-    while (anc && !options.every(o => anc.contains(o)) && guard++ < 30) anc = anc.parentElement;
+    while (anc && !options.every(o => anc.contains(o)) && guard++ < 40) anc = anc.parentElement;
     if (!anc) return "";
+
     let cur = anc;
-    for (let i = 0; i < 4; i++) {
-      if (cleanText(cur).length > 60) break;
+    for (let i = 0; i < 6; i++) {
       if (!cur.parentElement || cur.parentElement === document.body) break;
-      cur = cur.parentElement;
+      if (cleanText(cur.parentElement).length > cleanText(cur).length + 15) cur = cur.parentElement;
+      else break;
     }
-    const full = cleanText(cur);
-    const optTexts = options.map(cleanText).filter(Boolean);
-    let stem = full;
-    for (let i = 0; i < optTexts.length; i++) {
-      const idx = stem.indexOf(optTexts[i]);
-      if (idx > 0) { stem = stem.slice(0, idx); break; }
+
+    let full = cleanText(cur);
+
+    const longOpts = optTexts.filter(t => t.length >= 4);
+    for (let i = 0; i < longOpts.length; i++) {
+      const idx = full.indexOf(longOpts[i]);
+      if (idx > 5) { full = full.slice(0, idx); break; }
     }
-    stem = stem.trim();
-    return stem.length >= 8 ? stem : full.slice(0, 1500);
+
+    full = full.replace(/(^|\s)(\d{1,3}\s+){3,}/g, " ").replace(/\s+/g, " ").trim();
+
+    if (full.length >= 20) return full.slice(0, 2000);
+
+    const leaf = extractLeafStem(cur, options);
+    if (leaf.length >= 10) return leaf.slice(0, 2000);
+    return (full || cleanText(cur)).slice(0, 2000);
   }
 
   function findButton(re) {
@@ -318,8 +439,8 @@
       try { input.click(); } catch (e) {}
       if (!input.checked) {
         setNativeChecked(input, true);
-        input.dispatchEvent(new Event("input", { bubbles:true }));
-        input.dispatchEvent(new Event("change", { bubbles:true }));
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
       }
     }
     if (!isOptionSelected(el)) clickEl(el);
@@ -328,18 +449,18 @@
 
   function detectFeedback(options) {
     const correct = new Set(), wrong = new Set();
-    const OK  = ["correct","true","right","success","dung","đúng","answer-correct","is-correct"];
-    const BAD = ["incorrect","wrong","false","error","sai","answer-wrong","is-wrong","is-incorrect"];
+    const OK  = ["correct", "true", "right", "success", "dung", "đúng", "answer-correct", "is-correct"];
+    const BAD = ["incorrect", "wrong", "false", "error", "sai", "answer-wrong", "is-wrong", "is-incorrect"];
     options.forEach((o, i) => {
       const cls = (typeof o.className === "string" ? o.className : "").toLowerCase();
       const parts = cls.split(/\s+/).filter(Boolean);
       if (parts.some(p => OK.indexOf(p) >= 0))  correct.add(i);
       if (parts.some(p => BAD.indexOf(p) >= 0)) wrong.add(i);
     });
-    return { correct, wrong };
+    return { correct: correct, wrong: wrong };
   }
 
-  /* ============ APPLY / VERIFY ============ */
+  /* ================= APPLY / VERIFY ================= */
   async function applySelection(indices) {
     for (let round = 1; round <= RE_CHECK_ROUNDS; round++) {
       const opts = getOptionNodes();
@@ -350,18 +471,24 @@
       }
       await sleep(180 * round);
       const after = getOptionNodes();
-      let okCount = 0;
+      let ok = 0;
       for (let k = 0; k < indices.length; k++) {
         const el = after[indices[k]];
-        if (el && isOptionSelected(el)) okCount++;
+        if (el && isOptionSelected(el)) ok++;
       }
-      if (okCount === indices.length) return true;
-      log("Kiểm tra lại " + round + "/" + RE_CHECK_ROUNDS + ": " + okCount + "/" + indices.length + " đã chọn", "warn");
+      if (ok === indices.length) return true;
+      log("Kiểm tra lại " + round + "/" + RE_CHECK_ROUNDS + ": " + ok + "/" + indices.length + " đã chọn", "warn");
     }
     return false;
   }
 
   async function clickSubmitBtn() {
+    if (state.answered < 0) return false;
+    const opts = getOptionNodes();
+    if (opts.length && !opts.some(isOptionSelected)) {
+      log("Chưa chọn được đáp án nào — KHÔNG bấm nộp.", "warn");
+      return false;
+    }
     const btn = findButton(SUBMIT_RE);
     if (!btn || isDisabled(btn)) return false;
     clickEl(btn);
@@ -370,8 +497,8 @@
   }
 
   async function waitForChange(oldSig, timeoutMs) {
-    const start = Date.now();
-    while (Date.now() - start < (timeoutMs || NEXT_WAIT)) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < (timeoutMs || NEXT_WAIT)) {
       await sleep(250);
       const opts = getOptionNodes();
       if (!opts.length) continue;
@@ -381,11 +508,24 @@
     return false;
   }
 
+  async function waitForOptions(timeoutMs) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < (timeoutMs || QUESTION_WAIT_MS)) {
+      const opts = getOptionNodes();
+      if (opts.length) return opts;
+      await sleep(500);
+    }
+    return [];
+  }
+
+  /* --- chuyển câu: TUYỆT ĐỐI không tự nộp bài trừ khi bật --- */
   async function advance(prevSig) {
     await sleep(350);
+
     const next = findButton(NEXT_RE);
-    if (next && !isDisabled(next) && next.textContent.toLowerCase().indexOf("tiếp") >= 0) {
+    if (next && !isDisabled(next)) {
       clickEl(next);
+      log("→ Câu tiếp", "ok");
       if (await waitForChange(prevSig, NEXT_WAIT)) return true;
       const again = findButton(NEXT_RE);
       if (again && !isDisabled(again)) {
@@ -394,18 +534,36 @@
       }
       return false;
     }
-    const submit = findButton(SUBMIT_RE);
-    if (submit && !isDisabled(submit)) {
-      clickEl(submit);
-      log("Đã nộp bài — hoàn tất.", "ok");
-      setStatus("Hoàn tất");
-      stop();
-      return true;
+
+    if (getAutoSubmit() && state.answered > 0) {
+      const fin = findButton(FINAL_RE);
+      if (fin && !isDisabled(fin)) {
+        clickEl(fin);
+        log("Đã nộp bài (do bật 'Tự nộp bài cuối').", "ok");
+        setStatus("Hoàn tất");
+        stop();
+        return true;
+      }
+    } else {
+      log("Không thấy nút chuyển câu. KHÔNG tự nộp bài. Bật 'Tự nộp bài cuối' nếu muốn.", "warn");
+      setStatus("Chờ câu tiếp...");
     }
     return false;
   }
 
-  /* ============ SOLVE ============ */
+  async function safeAdvance(sig) {
+    const ok = await advance(sig);
+    if (ok) { state.advanceFail = 0; return true; }
+    state.advanceFail++;
+    if (state.advanceFail >= 10) {
+      log("Kẹt 10 lần không chuyển được câu — tự dừng để tránh treo.", "err");
+      setStatus("Bị kẹt — đã dừng");
+      stop();
+    }
+    return false;
+  }
+
+  /* ================= SOLVE ================= */
   async function reAsk(stem, optTexts, prevWrong) {
     try {
       const text = await askWithFallback(buildMessages(stem, optTexts, prevWrong), getModel());
@@ -414,19 +572,40 @@
   }
 
   async function solveCurrent() {
-    const options = getOptionNodes();
-    if (!options.length) { await handleEssay(); return; }
+    let options = getOptionNodes();
+
+    if (!options.length) {
+      const ta = Array.from(document.querySelectorAll("textarea")).find(t => !insideGui(t) && isVisible(t));
+      if (ta) { await handleEssay(ta); return; }
+
+      state.idleTicks++;
+      if (state.idleTicks === 1 || state.idleTicks % 5 === 0) {
+        log("Chưa thấy câu hỏi (có thể trang đang tải)... chờ.", "warn");
+        setStatus("Đang chờ câu hỏi...");
+      }
+      options = await waitForOptions(QUESTION_WAIT_MS);
+      if (!options.length) return;   // KHÔNG nhảy câu, KHÔNG nộp
+    }
+    state.idleTicks = 0;
 
     const stem     = getStem(options);
     const optTexts = options.map(cleanText);
     const sig      = hashStr(stem + "||" + optTexts.join("|"));
+
+    if (state.solvedSigs.has(sig)) {
+      log("Câu này đã giải trong phiên — chuyển tiếp.");
+      await safeAdvance(sig);
+      return;
+    }
 
     if (sig === state.lastSig) state.sameSigCount++;
     else { state.lastSig = sig; state.sameSigCount = 0; setStatus("Câu mới"); }
 
     if (state.sameSigCount > 4) {
       log("Câu lặp quá nhiều — chuyển câu.", "warn");
-      await advance(sig); state.sameSigCount = 0; return;
+      await safeAdvance(sig);
+      state.sameSigCount = 0;
+      return;
     }
 
     const fb0 = detectFeedback(options);
@@ -434,13 +613,15 @@
 
     if (alreadyAnswered && !getReSolveDone()) {
       log("Câu đã có đáp án — bỏ qua (bật 'Làm lại câu đã đúng' để giải lại).");
-      await advance(sig); return;
+      state.solvedSigs.add(sig);
+      await safeAdvance(sig);
+      return;
     }
 
-    log("Câu: " + stem.slice(0, 90).replace(/\n/g, " "));
+    log("Câu: " + stem.slice(0, 100).replace(/\n/g, " "));
 
-    let cached = state.cache.get(sig);
-    let indices;
+    let indices = null;
+    const cached = state.cache.get(sig);
     if (cached) {
       indices = cached.slice();
       log("Dùng cache: " + indices.map(i => String.fromCharCode(65 + i)).join(", "));
@@ -448,19 +629,27 @@
       setStatus("Đang hỏi AI...");
       let text;
       try { text = await askWithFallback(buildMessages(stem, optTexts), getModel()); }
-      catch (e) { log("API lỗi: " + e.message, "err"); setStatus("Lỗi API — thử lại sau"); return; }
+      catch (e) { log("API lỗi: " + e.message, "err"); setStatus("Lỗi API — thử lại"); return; }
+
       indices = parseAnswer(text, optTexts.length);
-      if (!indices.length) { log("Không đọc được đáp án — chuyển câu.", "err"); await advance(sig); return; }
+      if (!indices.length) {
+        log("AI không trả về đáp án đọc được — chờ câu khác (không nộp).", "err");
+        setStatus("AI trả lời không đọc được");
+        return;
+      }
       state.cache.set(sig, indices.slice());
       if (state.cache.size > 200) state.cache.delete(state.cache.keys().next().value);
       log("AI chọn: " + indices.map(i => String.fromCharCode(65 + i)).join(", "), "ok");
     }
 
-    let prevWrong = [], attempt = 0;
+    let prevWrong = [];
+    let attempt = 0;
+    let solvedOk = false;
+
     while (attempt <= MAX_ANSWER_RETRY) {
       setStatus("Đang chọn đáp án...");
       const applied = await applySelection(indices);
-      if (!applied) log("Không xác nhận được đáp án đã chọn.", "warn");
+      if (!applied) log("Chưa xác nhận được đáp án đã chọn.", "warn");
 
       let fb = detectFeedback(getOptionNodes());
 
@@ -469,19 +658,21 @@
         attempt++;
         if (attempt > MAX_ANSWER_RETRY) break;
         setStatus("Sai — xin đáp án khác...");
-        log("Đáp án sai (" + prevWrong.join(", ") + ") → chọn lại", "warn");
-        const next = await reAsk(stem, optTexts, prevWrong);
-        if (!next.length) break;
-        indices = next.filter(i => prevWrong.indexOf(String.fromCharCode(65 + i)) < 0);
-        if (!indices.length) indices = next;
+        log("Sai (" + prevWrong.join(", ") + ") → chọn lại", "warn");
+        const nxt = await reAsk(stem, optTexts, prevWrong);
+        if (!nxt.length) break;
+        indices = nxt.filter(i => prevWrong.indexOf(String.fromCharCode(65 + i)) < 0);
+        if (!indices.length) indices = nxt;
         state.cache.set(sig, indices.slice());
         continue;
       }
-      if (fb.correct.size) { log("Đã đúng.", "ok"); break; }
+
+      if (fb.correct.size) { log("Đã đúng.", "ok"); solvedOk = true; break; }
 
       const clicked = await clickSubmitBtn();
       if (!clicked) break;
-      await sleep(750);
+
+      await sleep(800);
       fb = detectFeedback(getOptionNodes());
 
       if (fb.wrong.size && indices.some(i => fb.wrong.has(i))) {
@@ -490,35 +681,44 @@
         if (attempt > MAX_ANSWER_RETRY) break;
         setStatus("Sai — chọn lại...");
         log("Nộp xong bị sai → chọn đáp án khác", "warn");
-        const next = await reAsk(stem, optTexts, prevWrong);
-        if (!next.length) break;
-        indices = next.filter(i => prevWrong.indexOf(String.fromCharCode(65 + i)) < 0);
-        if (!indices.length) indices = next;
+        const nxt = await reAsk(stem, optTexts, prevWrong);
+        if (!nxt.length) break;
+        indices = nxt.filter(i => prevWrong.indexOf(String.fromCharCode(65 + i)) < 0);
+        if (!indices.length) indices = nxt;
         state.cache.set(sig, indices.slice());
         continue;
       }
+
+      solvedOk = true;
       break;
     }
 
+    if (solvedOk) {
+      state.answered++;
+      state.solvedSigs.add(sig);
+    }
+
     setStatus("Đang chuyển câu...");
-    await advance(sig);
+    await safeAdvance(sig);
   }
 
-  async function handleEssay() {
-    const ta = Array.from(document.querySelectorAll("textarea")).find(t => !insideGui(t) && isVisible(t));
-    if (!ta) { log("Không thấy câu hỏi hoặc ô trả lời.", "warn"); return; }
+  async function handleEssay(ta) {
     if ((ta.value || "").trim().length > 3) {
       log("Ô trả lời đã có nội dung — chuyển câu.");
-      await advance(hashStr(cleanText(ta) + "||essay")); return;
+      state.solvedSigs.add(hashStr(cleanText(ta) + "||essay"));
+      await safeAdvance(hashStr(cleanText(ta) + "||essay"));
+      return;
     }
+
     let box = ta.parentElement;
     for (let i = 0; i < 4 && box; i++) { if (cleanText(box).length > 40) break; box = box.parentElement; }
     const stem = cleanText(box || ta).slice(0, 1500);
     if (!stem) return;
+
     setStatus("Đang giải tự luận...");
     const msgs = [
-      { role:"system", content:"Bạn giải bài tập. Trả lời ngắn gọn, chính xác, không giải thích dài." },
-      { role:"user",   content:stem }
+      { role: "system", content: "Bạn giải bài tập. Trả lời ngắn gọn, chính xác, không giải thích dài dòng." },
+      { role: "user", content: stem }
     ];
     try {
       const text = await askWithFallback(msgs, getModel());
@@ -527,11 +727,14 @@
       await sleep(300);
       const btn = findButton(SUBMIT_RE);
       if (btn && !isDisabled(btn)) { clickEl(btn); await sleep(700); }
-      await advance(hashStr(stem + "||essay"));
+      state.answered++;
+      const sig = hashStr(stem + "||essay");
+      state.solvedSigs.add(sig);
+      await safeAdvance(sig);
     } catch (e) { log("Lỗi tự luận: " + e.message, "err"); }
   }
 
-  /* ============ LOOP ============ */
+  /* ================= LOOP ================= */
   async function tick() {
     if (!state.running || state.busy) return;
     state.busy = true;
@@ -539,7 +742,7 @@
     try { await solveCurrent(); }
     catch (e) { log("Lỗi vòng lặp: " + (e && e.message ? e.message : e), "err"); }
     finally {
-      if (Date.now() - started > 90000) log("Vòng lặp chạy quá lâu — đã reset.", "warn");
+      if (Date.now() - started > 120000) log("Vòng lặp chạy quá lâu — đã reset.", "warn");
       state.busy = false;
     }
     if (state.running) state.timers.push(setTimeout(tick, getInterval()));
@@ -547,23 +750,30 @@
 
   function start() {
     if (state.running) return;
-    state.running = true; state.busy = false; state.sameSigCount = 0;
-    setStatus("Đang chạy..."); log("▶ Bắt đầu", "ok"); tick();
-  }
-  function stop() {
-    state.running = false; state.busy = false;
-    state.timers.forEach(t => clearTimeout(t)); state.timers = [];
-    setStatus("Đã dừng"); log("■ Dừng", "warn");
+    state.running = true; state.busy = false;
+    state.sameSigCount = 0; state.advanceFail = 0; state.idleTicks = 0;
+    state.solvedSigs = new Set();
+    setStatus("Đang chạy...");
+    log("▶ Bắt đầu", "ok");
+    tick();
   }
 
-  /* ============ GUI ============ */
+  function stop() {
+    state.running = false; state.busy = false;
+    for (let i = 0; i < state.timers.length; i++) clearTimeout(state.timers[i]);
+    state.timers = [];
+    setStatus("Đã dừng");
+    log("■ Dừng", "warn");
+  }
+
+  /* ================= GUI ================= */
   function log(msg, type) {
     const box = document.getElementById("ais-log");
     const line = document.createElement("div");
     line.className = "ais-line" + (type ? " ais-" + type : "");
     const t = new Date();
-    const stamp = String(t.getHours()).padStart(2,"0") + ":" + String(t.getMinutes()).padStart(2,"0") + ":" + String(t.getSeconds()).padStart(2,"0");
-    line.textContent = "[" + stamp + "] " + msg;
+    const st = String(t.getHours()).padStart(2, "0") + ":" + String(t.getMinutes()).padStart(2, "0") + ":" + String(t.getSeconds()).padStart(2, "0");
+    line.textContent = "[" + st + "] " + msg;
     if (box) {
       box.appendChild(line);
       while (box.childNodes.length > 60) box.removeChild(box.firstChild);
@@ -619,13 +829,15 @@
     const root = document.createElement("div");
     root.id = GUI_ID;
 
-    const optHtml = MODEL_CHOICES.map(m =>
-      '<option value="' + m + '">' + m + (m === DEFAULT_MODEL ? " (Mặc định)" : "") + "</option>"
-    ).join("");
+    let optHtml = "";
+    for (let i = 0; i < MODEL_CHOICES.length; i++) {
+      const m = MODEL_CHOICES[i];
+      optHtml += '<option value="' + m + '">' + m + (m === DEFAULT_MODEL ? " (Mặc định)" : "") + "</option>";
+    }
 
     root.innerHTML =
       '<div class="ais-head" id="ais-head">' +
-        '<span class="ais-title">⚡ ai slover v38.5</span>' +
+        '<span>⚡ ai slover v38.6</span>' +
         '<span class="ais-min" id="ais-min">–</span>' +
       '</div>' +
       '<div class="ais-body" id="ais-body">' +
@@ -633,13 +845,14 @@
         '<div class="ais-row"><label>Model khác</label><input id="ais-model-custom" type="text" placeholder="vd: gemini-2.5-flash"></div>' +
         '<div class="ais-row"><label>Chu kỳ (ms)</label><input id="ais-interval" type="number" min="1200" step="500"></div>' +
         '<div class="ais-row ais-check"><label><input id="ais-resolve" type="checkbox"> Làm lại câu đã đúng</label></div>' +
+        '<div class="ais-row ais-check"><label><input id="ais-autosubmit" type="checkbox"> Tự nộp bài khi hết câu (nguy hiểm)</label></div>' +
         '<div class="ais-btns">' +
           '<button id="ais-start">▶ Start</button>' +
           '<button id="ais-stop">■ Stop</button>' +
         '</div>' +
         '<div class="ais-status" id="ais-status">Sẵn sàng</div>' +
         '<div class="ais-log" id="ais-log"></div>' +
-        '<div class="ais-foot">v38.5 · DeepSeek V4 Flash · fetch-first</div>' +
+        '<div class="ais-foot">v38.6 · không tự nộp bài · DeepSeek mặc định</div>' +
       '</div>';
     document.body.appendChild(root);
 
@@ -647,6 +860,7 @@
     const inpCustom = document.getElementById("ais-model-custom");
     const inpInt    = document.getElementById("ais-interval");
     const chkRes    = document.getElementById("ais-resolve");
+    const chkAuto   = document.getElementById("ais-autosubmit");
 
     const savedModel = localStorage.getItem(MODEL_KEY) || DEFAULT_MODEL;
     if (MODEL_CHOICES.indexOf(savedModel) >= 0) selModel.value = savedModel;
@@ -654,14 +868,18 @@
     inpCustom.value = localStorage.getItem(MODEL_CUSTOM_KEY) || inpCustom.value || "";
     inpInt.value    = String(getInterval());
     chkRes.checked  = getReSolveDone();
+    chkAuto.checked = getAutoSubmit();
 
     selModel.addEventListener("change", function () {
-      localStorage.setItem(MODEL_KEY, selModel.value); log("Model = " + selModel.value, "ok");
+      localStorage.setItem(MODEL_KEY, selModel.value);
+      localStorage.removeItem(MODEL_WORKING);
+      log("Model = " + selModel.value, "ok");
     });
     inpCustom.addEventListener("change", function () {
       const v = inpCustom.value.trim();
       if (v) localStorage.setItem(MODEL_CUSTOM_KEY, v);
       else localStorage.removeItem(MODEL_CUSTOM_KEY);
+      localStorage.removeItem(MODEL_WORKING);
       log("Model custom = " + (v || "(trống)"), "ok");
     });
     inpInt.addEventListener("change", function () {
@@ -671,6 +889,11 @@
     chkRes.addEventListener("change", function () {
       localStorage.setItem(RESOLVE_KEY, chkRes.checked ? "true" : "false");
     });
+    chkAuto.addEventListener("change", function () {
+      localStorage.setItem(AUTOSUBMIT_KEY, chkAuto.checked ? "true" : "false");
+      if (chkAuto.checked) log("⚠ Đã bật tự nộp bài cuối!", "warn");
+    });
+
     document.getElementById("ais-start").addEventListener("click", e => { e.preventDefault(); start(); });
     document.getElementById("ais-stop").addEventListener("click",  e => { e.preventDefault(); stop();  });
 
@@ -684,33 +907,23 @@
 
     const head = document.getElementById("ais-head");
     let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
-    head.addEventListener("mousedown", function (e) {
-      dragging = true; sx = e.clientX; sy = e.clientY;
+    function startDrag(cx, cy) {
+      dragging = true; sx = cx; sy = cy;
       const r = root.getBoundingClientRect(); ox = r.left; oy = r.top;
       root.style.right = "auto"; root.style.bottom = "auto";
       root.style.left = ox + "px"; root.style.top = oy + "px";
-    });
-    head.addEventListener("touchstart", function (e) {
-      const p = e.touches[0]; dragging = true; sx = p.clientX; sy = p.clientY;
-      const r = root.getBoundingClientRect(); ox = r.left; oy = r.top;
-      root.style.right = "auto"; root.style.bottom = "auto";
-      root.style.left = ox + "px"; root.style.top = oy + "px";
-    }, { passive:true });
-    document.addEventListener("mousemove", function (e) {
+    }
+    function moveDrag(cx, cy) {
       if (!dragging) return;
-      const nx = Math.max(0, Math.min(window.innerWidth  - 60, ox + (e.clientX - sx)));
-      const ny = Math.max(0, Math.min(window.innerHeight - 40, oy + (e.clientY - sy)));
+      const nx = Math.max(0, Math.min(window.innerWidth  - 60, ox + (cx - sx)));
+      const ny = Math.max(0, Math.min(window.innerHeight - 40, oy + (cy - sy)));
       root.style.left = nx + "px"; root.style.top = ny + "px";
-    });
-    document.addEventListener("touchmove", function (e) {
-      if (!dragging) return;
-      const p = e.touches[0];
-      const nx = Math.max(0, Math.min(window.innerWidth  - 60, ox + (p.clientX - sx)));
-      const ny = Math.max(0, Math.min(window.innerHeight - 40, oy + (p.clientY - sy)));
-      root.style.left = nx + "px"; root.style.top = ny + "px";
-      e.preventDefault();
-    }, { passive:false });
-    document.addEventListener("mouseup",  () => dragging = false);
+    }
+    head.addEventListener("mousedown", e => startDrag(e.clientX, e.clientY));
+    head.addEventListener("touchstart", e => { const p = e.touches[0]; startDrag(p.clientX, p.clientY); }, { passive: true });
+    document.addEventListener("mousemove", e => moveDrag(e.clientX, e.clientY));
+    document.addEventListener("touchmove", e => { const p = e.touches[0]; moveDrag(p.clientX, p.clientY); if (dragging) e.preventDefault(); }, { passive: false });
+    document.addEventListener("mouseup", () => dragging = false);
     document.addEventListener("touchend", () => dragging = false);
 
     log("GUI sẵn sàng · default: " + DEFAULT_MODEL, "ok");
