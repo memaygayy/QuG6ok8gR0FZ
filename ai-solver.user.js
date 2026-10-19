@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         AI Solver v39.2
+// @name         AI Solver v39.3
 // @namespace    https://onluyen.vn/
-// @version      39.2.0
-// @description  Tự động giải trắc nghiệm + tự luận onluyen.vn (bấm nút Trả lời sau khi chọn)
+// @version      39.3.0
+// @description  Tự động giải trắc nghiệm + điền từ + tự luận onluyen.vn
 // @match        https://*.onluyen.vn/*
 // @match        https://onluyen.vn/*
 // @grant        GM_xmlhttpRequest
@@ -18,7 +18,7 @@
 (function () {
   "use strict";
 
-  const VERSION_STR      = "39.2.0";
+  const VERSION_STR      = "39.3.0";
   const GUI_ID           = "ai-solver-v38";
   const PROXY_URL        = "https://gen.pollinations.ai/v1/chat/completions";
   const POLL_KEY         = "sk_D8PP0K4jFUDUa0zjrx7uxq1XM1ZoVINK";
@@ -74,14 +74,11 @@
   function hash(s) { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36) + "-" + s.length; }
   function stripFences(s) { return String(s || "").replace(/^\s*```[a-z]*\s*/i, "").replace(/\s*```\s*$/i, "").trim(); }
   function shortModel(m) { return String(m || "").split("/").pop(); }
-
   function visible(el) {
     if (!el || !el.isConnected) return false;
-    let r;
-    try { r = el.getBoundingClientRect(); } catch (e) { return false; }
+    let r; try { r = el.getBoundingClientRect(); } catch (e) { return false; }
     if (r.width < 3 || r.height < 3) return false;
-    let st;
-    try { st = window.getComputedStyle(el); } catch (e) { return true; }
+    let st; try { st = window.getComputedStyle(el); } catch (e) { return true; }
     if (!st) return true;
     if (st.display === "none" || st.visibility === "hidden") return false;
     if (parseFloat(st.opacity) === 0) return false;
@@ -90,7 +87,7 @@
 
   /* ---------- GUI ---------- */
   const CSS = `
-#${GUI_ID}{position:fixed;top:10px;right:10px;width:340px;max-height:88vh;display:flex;flex-direction:column;background:#0b1220;color:#e6edf7;border:1px solid #1e293b;border-radius:12px;z-index:2147483000;font:12px/1.45 system-ui;box-shadow:0 12px 34px rgba(0,0,0,.5);overflow:hidden}
+#${GUI_ID}{position:fixed;top:10px;right:10px;width:342px;max-height:88vh;display:flex;flex-direction:column;background:#0b1220;color:#e6edf7;border:1px solid #1e293b;border-radius:12px;z-index:2147483000;font:12px/1.45 system-ui;box-shadow:0 12px 34px rgba(0,0,0,.5);overflow:hidden}
 #${GUI_ID} .ais-head{display:flex;align-items:center;justify-content:space-between;padding:7px 10px;background:#111c33;cursor:move;user-select:none}
 #${GUI_ID} .ais-title{font-weight:700;font-size:12px;color:#7dd3fc}
 #${GUI_ID} .ais-head button{background:#1e293b;color:#cbd5e1;border:0;border-radius:6px;width:22px;height:20px;cursor:pointer;margin-left:4px}
@@ -105,7 +102,7 @@
 #${GUI_ID} #ais-stop{background:#334155;color:#e2e8f0}
 #${GUI_ID} .ais-status{margin:8px 0 5px;padding:6px 8px;background:#111c33;border-radius:7px;color:#93c5fd;font-size:11px}
 #${GUI_ID} .ais-answer{padding:6px 8px;background:#0f2a1d;border:1px solid #14532d;border-radius:7px;color:#86efac;font-size:11px;margin-bottom:6px;display:none;white-space:pre-wrap;word-break:break-word}
-#${GUI_ID} .ais-log{height:162px;overflow:auto;background:#050a14;border:1px solid #16233a;border-radius:7px;padding:5px 7px;font:11px/1.35 ui-monospace,monospace;color:#9fb3c8;white-space:pre-wrap;word-break:break-word}
+#${GUI_ID} .ais-log{height:168px;overflow:auto;background:#050a14;border:1px solid #16233a;border-radius:7px;padding:5px 7px;font:11px/1.35 ui-monospace,monospace;color:#9fb3c8;white-space:pre-wrap;word-break:break-word}
 #${GUI_ID} .ais-foot{padding:5px 10px;background:#111c33;color:#64748b;font-size:10px;text-align:center}
 #${GUI_ID}.ais-min .ais-body,#${GUI_ID}.ais-min .ais-foot{display:none}`;
 
@@ -114,7 +111,7 @@
     const st = document.createElement("style"); st.textContent = CSS; document.head.appendChild(st);
     const root = document.createElement("div"); root.id = GUI_ID;
     root.innerHTML = `
-<div class="ais-head"><span class="ais-title">⚡ ai slover v39.2</span><span><button data-act="min">–</button><button data-act="max">+</button></span></div>
+<div class="ais-head"><span class="ais-title">⚡ ai slover v39.3</span><span><button data-act="min">–</button><button data-act="max">+</button></span></div>
 <div class="ais-body">
 <div class="ais-row"><label>Model</label><select id="ais-model"></select></div>
 <div class="ais-row"><label>Model khác</label><input id="ais-custom" type="text" placeholder="vd: mistral"></div>
@@ -127,7 +124,7 @@
 <div class="ais-answer" id="ais-answer"></div>
 <div class="ais-log" id="ais-log"></div>
 </div>
-<div class="ais-foot">v39.2 · bấm nút "Trả lời" sau khi chọn · không bấm Bỏ qua</div>`;
+<div class="ais-foot">v39.3 · điền từ (input) · chống nhảy cóc · nav phiếu trả lời</div>`;
     document.body.appendChild(root);
 
     const sel = root.querySelector("#ais-model");
@@ -179,6 +176,7 @@
   function getQuestionNumber() { const el = qs("#test-step-question .question-header .num") || qs(".question-header .num"); return el ? clean(el.innerText) : ""; }
   function getPassage() { const el = qs("#test-step-question .question-text") || qs(".question-text"); return el ? clean(el.innerText) : ""; }
   function getStem() { const el = qs("#test-step-question .question-name") || qs(".question-name") || qs(".question-stem"); return el ? clean(el.innerText) : ""; }
+
   function optionText(el) { const c = el.querySelector(".question-option-content,.option-content,.content,p"); return clean(c ? c.innerText : el.innerText); }
   function isUsableOption(el) {
     if (!el || insideGui(el)) return false;
@@ -204,12 +202,44 @@
     if (/is-(selected|checked|active)/.test(cls)) return true;
     return false;
   }
-  function getEssayTextarea() {
-    const a = qs("#test-step-questiontextarea");
-    if (a && !insideGui(a)) return a;
-    const b = qsa("textarea").filter(t => !insideGui(t) && !t.disabled && !t.readOnly)[0];
-    return b || null;
+
+  /* ---------- ĐIỀN TỪ: <input config-typeaction="text"> ---------- */
+  function isNoteArea(el) {
+    return !!(el.closest && (el.closest(".popupNoteV2") || el.closest("#test-step-questionnoteTextarea")));
   }
+  function getFillInputs() {
+    const list = qsa('#test-step-question input[type="text"], #test-step-question input:not([type])');
+    return list.filter(el =>
+      !insideGui(el) && !isNoteArea(el) && !el.disabled && !el.readOnly &&
+      !el.closest(".answer-sheet") && visible(el)
+    );
+  }
+  function stemWithBlanks(inputs) {
+    const root = qs("#test-step-question .question-name") || qs(".question-name") || qs(".question-stem");
+    if (!root) return getStem();
+    try {
+      const clone = root.cloneNode(true);
+      const cloneInputs = Array.from(clone.querySelectorAll('input[type="text"],input:not([type])'));
+      cloneInputs.forEach((inp, i) => {
+        const sp = document.createElement("span");
+        sp.textContent = " [___" + (i + 1) + "___] ";
+        if (inp.parentNode) inp.parentNode.replaceChild(sp, inp);
+      });
+      const t = clean(clone.innerText);
+      if (t) return t;
+    } catch (e) {}
+    return getStem();
+  }
+
+  /* ---------- tự luận: chỉ textarea THẬT (không phải ô ghi chú) ---------- */
+  function getEssayTextarea() {
+    const list = qsa("textarea").filter(t =>
+      !insideGui(t) && !t.disabled && !t.readOnly && !isNoteArea(t) &&
+      t.id !== "test-step-questiontextarea" && visible(t)
+    );
+    return list[0] || null;
+  }
+
   function answeredCount() {
     const fields = qsa(".left-side .report .field,.report .field");
     for (const f of fields) {
@@ -234,24 +264,61 @@
     }
     return false;
   }
+  function sheetOptions() { return qsa(".answer-sheet .option"); }
+  function sheetCurrentDone() {
+    const opts = sheetOptions();
+    const act = opts.find(o => o.classList.contains("active"));
+    return act ? act.classList.contains("done") : false;
+  }
+  function clickSheetNext() {
+    const opts = sheetOptions();
+    if (!opts.length) return false;
+    let idx = opts.findIndex(o => o.classList.contains("active"));
+    if (idx < 0) return false;
+    const target = opts[idx + 1];
+    if (!target) return false;
+    try { target.scrollIntoView({ block: "center" }); } catch (e) {}
+    try { target.click(); } catch (e) {}
+    return true;
+  }
+
   function questionSignature(opts) {
     return hash(getQuestionNumber() + "|" + getStem().slice(0, 200) + "|" + (opts || []).map(el => optionText(el).slice(0, 50)).join("§"));
   }
+  function currentSignature() {
+    const opts = getOptionEls();
+    const fills = getFillInputs();
+    return hash(getQuestionNumber() + "|" + getStem().slice(0, 200) + "|" +
+      opts.map(el => optionText(el).slice(0, 50)).join("§") + "|fill:" + fills.length);
+  }
 
   /* ---------- nút bấm ---------- */
-  function logSubmitBar() {
-    const parts = [];
+  function submitBarButtons() {
+    const out = [];
     for (const bar of qsa(".submit-bar")) {
       for (const b of Array.from(bar.querySelectorAll("button"))) {
-        const t = clean(b.innerText || b.getAttribute("aria-label") || "").slice(0, 16) || "(icon)";
-        parts.push("[" + t + (visible(b) ? "" : "/ẩn") + "]");
+        if (insideGui(b)) continue;
+        out.push(b);
       }
     }
-    if (parts.length) log("submit-bar: " + parts.join(" "));
+    return out;
+  }
+  function submitBarTexts() { return submitBarButtons().map(b => clean(b.innerText || b.getAttribute("aria-label") || "")); }
+  function logSubmitBar() {
+    const t = submitBarTexts();
+    if (t.length) log("submit-bar: [" + t.map(x => (x || "(icon)").toUpperCase()).join("] [") + "]");
+  }
+  function findNewAnswerButton(beforeTexts) {
+    for (const b of submitBarButtons()) {
+      if (!visible(b)) continue;
+      const t = clean(b.innerText || b.getAttribute("aria-label") || "");
+      if (/(bỏ qua|skip|nộp bài|xác nhận nộp)/i.test(t)) continue;
+      if (beforeTexts.indexOf(t) < 0) return b;
+    }
+    return null;
   }
 
   function findAnswerButton() {
-    // 1) trong .submit-bar
     for (const bar of qsa(".submit-bar")) {
       const btns = Array.from(bar.querySelectorAll("button")).filter(b => !insideGui(b) && visible(b));
       const cands = btns.filter(b => {
@@ -266,14 +333,13 @@
       const nonGray = cands.find(b => !/(^|\s)btn-gray(\s|$)/.test(String(b.className || "")));
       return nonGray || cands[0];
     }
-    // 2) fallback ngoài .submit-bar
     for (const b of qsa("button,a.btn,.btn")) {
       if (insideGui(b) || !visible(b)) continue;
       if (b.closest(".answer-sheet") || b.closest(".submit-button") || b.closest(".mobile-bottom-bar")) continue;
+      if (b.closest(".submit-bar")) continue;
       const t = clean(b.innerText || b.getAttribute("aria-label") || b.title || "");
       if (!t) continue;
-      if (/(bỏ qua|skip|nộp bài)/i.test(t)) continue;
-      if (/(câu tiếp|câu sau|tiếp theo|next)/i.test(t)) continue;
+      if (/(bỏ qua|skip|nộp bài|câu tiếp|câu sau|tiếp theo|next)/i.test(t)) continue;
       if (ANSWER_BTN_RE.test(t)) return b;
     }
     return null;
@@ -284,8 +350,7 @@
       if (!visible(b)) continue;
       if (b.querySelector(".fa-chevron-right")) return b;
     }
-    const all = qsa("button,a.btn,.btn");
-    for (const b of all) {
+    for (const b of qsa("button,a.btn,.btn")) {
       if (insideGui(b) || !visible(b)) continue;
       if (b.closest(".answer-sheet") || b.closest(".submit-button")) continue;
       const t = clean(b.innerText || b.getAttribute("aria-label") || b.title || "");
@@ -294,16 +359,10 @@
       if (ANSWER_BTN_RE.test(t) && !NEXT_RE.test(t)) continue;
       if (NEXT_RE.test(t)) return b;
     }
-    for (const b of all) {
+    for (const b of qsa("button,a.btn,.btn")) {
       if (insideGui(b) || !visible(b)) continue;
       if (b.closest(".answer-sheet") || b.closest(".submit-button")) continue;
       if (b.querySelector(".fa-chevron-right")) return b;
-    }
-    const bar = qsa(".mobile-bottom-bar .nav-btn,.mobile-bottom-bar button").filter(visible);
-    if (bar.length >= 2) {
-      const last = bar[bar.length - 1];
-      const t = clean(last.innerText || last.getAttribute("aria-label") || "");
-      if (!BAD_BTN_RE.test(t)) return last;
     }
     return null;
   }
@@ -326,17 +385,13 @@
     return false;
   }
 
-  /* ---------- trạng thái câu ---------- */
   function hasResultMark() {
-    return qsa(".question-option.correct,.question-option.wrong,.question-option.is-correct,.question-option.is-wrong,.question-option.true,.question-option.false").length > 0;
+    return qsa(".question-option.correct,.question-option.wrong,.question-option.is-correct,.question-option.is-wrong").length > 0;
   }
   function submitBarHasNext() {
-    for (const bar of qsa(".submit-bar")) {
-      for (const b of Array.from(bar.querySelectorAll("button"))) {
-        if (insideGui(b) || !visible(b)) continue;
-        const t = clean(b.innerText || b.getAttribute("aria-label") || "");
-        if (/(câu tiếp|câu sau|tiếp theo|next)/i.test(t)) return true;
-      }
+    for (const b of submitBarButtons()) {
+      if (insideGui(b) || !visible(b)) continue;
+      if (NEXT_RE.test(clean(b.innerText || b.getAttribute("aria-label") || ""))) return true;
     }
     return false;
   }
@@ -423,6 +478,45 @@
     return { idxs, explain, raw: idxs.map(i => String.fromCharCode(65 + i)).join(",") };
   }
 
+  /* ---------- parse điền từ ---------- */
+  function tidyAnswer(s) {
+    return stripFences(String(s || ""))
+      .replace(/^["'`“”‘’\s]+|["'`“”‘’\s]+$/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+  function parseFillAnswers(raw, n) {
+    const text = String(raw || "");
+    let arr = null, explain = "";
+    const a = text.indexOf("{"), b = text.lastIndexOf("}");
+    if (a >= 0 && b > a) {
+      try {
+        const j = JSON.parse(text.slice(a, b + 1));
+        if (j) {
+          const v = j.answers != null ? j.answers : j.answer;
+          if (v != null) arr = Array.isArray(v) ? v.slice() : [v];
+          explain = String(j.explain || j.explanation || "");
+        }
+      } catch (e) {}
+    }
+    if (!arr) {
+      const t = extractBareAnswer(text);
+      if (!t) return null;
+      if (n === 1) arr = [t];
+      else {
+        let parts = t.split(/\r?\n+/).map(s => s.trim()).filter(Boolean);
+        if (parts.length < n) parts = t.split(/\s*[|;]\s*/).map(s => s.trim()).filter(Boolean);
+        if (parts.length < n) parts = t.split(/\s*,\s*/).map(s => s.trim()).filter(Boolean);
+        arr = parts;
+      }
+    }
+    arr = arr.map(tidyAnswer).filter(Boolean);
+    if (!arr.length) return null;
+    if (n === 1) return { values: [arr[0]], explain };
+    if (arr.length < n) return null;
+    return { values: arr.slice(0, n), explain };
+  }
+
   /* ---------- cắt rác tự luận ---------- */
   function extractBareAnswer(raw) {
     let t = stripFences(String(raw || "")).trim();
@@ -459,18 +553,28 @@
     user += "Ý kiến cho rằng đáp án là: " + proposal + ". Kiểm tra lại và trả JSON {\"answer\":\"X\",\"explain\":\"...\"}";
     return [{ role: "system", content: "Bạn là người kiểm tra, chỉ trả JSON." }, { role: "user", content: user }];
   }
+  function buildFillMessages(ctx) {
+    let user = "";
+    if (ctx.passage && ctx.passage !== ctx.stem) user += "Ngữ liệu:\n" + trunc(ctx.passage, 1800) + "\n\n";
+    user += "Đề bài:\n" + trunc(ctx.stem, 2200) + "\n\n";
+    user += "Có " + ctx.blanks + " chỗ trống, ký hiệu [___1___], [___2___]... trong đề.\n";
+    user += "Hãy điền từ / cụm từ / dạng đúng của từ cho từng chỗ trống.\n";
+    user += "Chỉ trả JSON: {\"answers\":[\"...\"]}";
+    if (ctx.blanks === 1) user += " (mảng có đúng 1 phần tử)";
+    user += ". CHỈ ghi phần cần điền, KHÔNG ghi lại cả câu, KHÔNG thêm \"Đáp án:\", KHÔNG giải thích, KHÔNG dịch.";
+    return [{ role: "system", content: "Bạn là giáo viên tiếng Anh. Chỉ trả JSON, không thêm chữ nào khác." }, { role: "user", content: user }];
+  }
   function buildEssayMessages(ctx) {
     let user = "";
     if (ctx.passage && ctx.passage !== ctx.stem) user += "Ngữ liệu:\n" + trunc(ctx.passage, 2500) + "\n\n";
     user += "Đề bài:\n" + trunc(ctx.stem, 2500) + "\n\n";
-    user += "QUY TẮC:\n- Điền từ / chia dạng từ / viết lại câu / điền số: CHỈ trả về đúng cụm từ hoặc câu cần điền.\n";
-    user += "- KHÔNG viết \"Đáp án:\", KHÔNG \"Câu đúng:\", KHÔNG giải thích, KHÔNG dịch, KHÔNG đánh số.\n";
-    user += "- Viết đoạn văn / nghị luận: trả về đoạn văn hoàn chỉnh bằng tiếng Việt, không markdown.\n";
+    user += "QUY TẮC:\n- Viết đoạn văn / nghị luận: trả về đoạn văn hoàn chỉnh bằng tiếng Việt, không markdown.\n";
+    user += "- KHÔNG viết \"Đáp án:\", KHÔNG giải thích, KHÔNG dịch, KHÔNG đánh số.\n";
     user += "- Trả lời thẳng, không mở bài kết luận thừa.";
     return [{ role: "system", content: "Bạn là giáo viên chấm bài. Trả lời đúng định dạng, không thêm chữ thừa." }, { role: "user", content: user }];
   }
 
-  /* ---------- chọn đáp án ---------- */
+  /* ---------- chọn đáp án MCQ ---------- */
   function forceClick(el) {
     if (!el) return;
     try { el.scrollIntoView({ block: "center" }); } catch (e) {}
@@ -521,30 +625,19 @@
     return { ok, clicked: anyClicked };
   }
 
-  /* ---------- BẤM "TRẢ LỜI" ---------- */
-  async function clickAnswerAndConfirm() {
-    const ab = findAnswerButton();
-    if (!ab) return { clicked: false, ok: false, reason: "no-button" };
-
-    const before = answeredCount();
-    log("Bấm nút: \"" + trunc(clean(ab.innerText || ab.getAttribute("aria-label") || "(icon)"), 24) + "\"");
-    try { ab.scrollIntoView({ block: "center" }); } catch (e) {}
-    try { ab.click(); } catch (e) {}
-    try { ab.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })); } catch (e) {}
-
-    await sleep(700);
-    dismissDialog();
-    await sleep(700);
-    dismissDialog();
-    await sleep(400);
-
-    const after = answeredCount();
-    const mark = hasResultMark();
-    const gone = !findAnswerButton();
-    const nextNow = submitBarHasNext();
-    const counterUp = before >= 0 && after > before;
-    const ok = counterUp || mark || gone || nextNow;
-    return { clicked: true, ok, before, after, mark, gone, nextNow };
+  /* ---------- nhập giá trị vào ô điền từ ---------- */
+  function typeInto(el, value) {
+    if (!el) return;
+    try { el.scrollIntoView({ block: "center" }); } catch (e) {}
+    try { el.focus(); } catch (e) {}
+    try {
+      const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+      if (desc && desc.set) desc.set.call(el, value); else el.value = value;
+    } catch (e) { el.value = value; }
+    try { el.dispatchEvent(new Event("input", { bubbles: true })); } catch (e) {}
+    try { el.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "a" })); } catch (e) {}
+    try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch (e) {}
+    try { el.dispatchEvent(new Event("blur", { bubbles: true })); } catch (e) {}
   }
 
   function setNativeValue(el, value) {
@@ -559,24 +652,54 @@
     try { el.focus(); } catch (e) {}
   }
 
+  /* ---------- BẤM "TRẢ LỜI" ---------- */
+  async function clickAnswerAndConfirm(sigBefore) {
+    const ab = findAnswerButton();
+    if (!ab) return { clicked: false, ok: false };
+
+    const before = answeredCount();
+    log("Bấm nút: \"" + trunc(clean(ab.innerText || ab.getAttribute("aria-label") || "(icon)"), 24) + "\"");
+    try { ab.scrollIntoView({ block: "center" }); } catch (e) {}
+    try { ab.click(); } catch (e) {}
+    try { ab.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })); } catch (e) {}
+
+    await sleep(700);
+    dismissDialog();
+    await sleep(700);
+    dismissDialog();
+    await sleep(400);
+
+    const after = answeredCount();
+    const advanced = sigBefore && currentSignature() !== sigBefore;
+    const ok = advanced || hasResultMark() || !findAnswerButton() || submitBarHasNext() ||
+               (before >= 0 && after > before);
+    return { clicked: true, ok, advanced, after };
+  }
+
   /* ---------- điều hướng ---------- */
   async function advance() {
     const btn = findNextButton();
-    if (!btn) {
-      state.stuck++;
-      if (state.stuck >= 6) {
-        log("Không tìm thấy nút chuyển câu sau 6 lần — dừng.");
-        setStatus("Kẹt: không thấy nút chuyển câu.");
-        state.running = false;
-        return;
-      }
-      setStatus("Không thấy nút tiếp — chờ... (" + state.stuck + "/6)");
+    if (btn) {
+      state.stuck = 0;
+      try { btn.scrollIntoView({ block: "center" }); } catch (e) {}
+      try { btn.click(); } catch (e) {}
+      await sleep(1000);
       return;
     }
-    state.stuck = 0;
-    try { btn.scrollIntoView({ block: "center" }); } catch (e) {}
-    try { btn.click(); } catch (e) {}
-    await sleep(900);
+    if (clickSheetNext()) {
+      state.stuck = 0;
+      log("Không có nút Tiếp — chuyển câu bằng phiếu trả lời.");
+      await sleep(1100);
+      return;
+    }
+    state.stuck++;
+    if (state.stuck >= 6) {
+      log("Không tìm thấy nút chuyển câu sau 6 lần — dừng.");
+      setStatus("Kẹt: không thấy nút chuyển câu.");
+      state.running = false;
+      return;
+    }
+    setStatus("Không thấy nút tiếp — chờ... (" + state.stuck + "/6)");
   }
 
   /* ---------- vòng lặp ---------- */
@@ -591,22 +714,28 @@
       return;
     }
 
+    const fills = getFillInputs();
+    if (fills.length) return stepFill(fills);
+
     const ta = getEssayTextarea();
     const opts = getOptionEls();
 
-    if (!opts.length && !ta) { setStatus("Chưa thấy đáp án… chờ render (" + getQuestionNumber() + ")"); return; }
+    if (!opts.length && !ta) {
+      if (sheetCurrentDone()) {
+        log("Câu hiện tại đã làm xong (phiếu trả lời đánh dấu) — chuyển câu.");
+        await advance();
+        return;
+      }
+      setStatus("Chưa thấy câu hỏi… chờ render (" + getQuestionNumber() + ")");
+      return;
+    }
     if (!opts.length && ta) return stepEssay(ta);
 
     const sig = questionSignature(opts);
-    if (sig !== state.lastSig) {
-      state.lastSig = sig;
-      state.stuck = 0;
-      logSubmitBar();
-    }
+    if (sig !== state.lastSig) { state.lastSig = sig; state.stuck = 0; logSubmitBar(); }
     if (sig === state.doneSig) { await advance(); return; }
 
-    const qstate = questionAnsweredState();
-    if (qstate === "answered") {
+    if (questionAnsweredState() === "answered") {
       log("Câu này đã trả lời xong (đáp án khoá) — chuyển câu.");
       state.doneSig = sig;
       await advance();
@@ -657,37 +786,94 @@
     }
 
     let sel = await applyAnswer(opts, finalAns.idxs);
-    if (!sel.ok) {
-      log("⚠ Chọn hụt " + finalAns.raw + " — thử lần 2.");
-      await sleep(500);
-      sel = await applyAnswer(opts, finalAns.idxs);
-    }
-    if (!sel.ok) {
-      log("⚠ Vẫn không tick được " + finalAns.raw + " — không chuyển câu, thử lại sau.");
-      setStatus("Không tick được đáp án — thử lại.");
-      return;
-    }
+    if (!sel.ok) { log("⚠ Chọn hụt " + finalAns.raw + " — thử lần 2."); await sleep(500); sel = await applyAnswer(opts, finalAns.idxs); }
+    if (!sel.ok) { log("⚠ Vẫn không tick được " + finalAns.raw + " — không chuyển câu."); setStatus("Không tick được đáp án — thử lại."); return; }
     log("Đã tick " + finalAns.raw + ".");
 
-    const conf = await clickAnswerAndConfirm();
-    if (!conf.clicked) {
-      log("⚠ KHÔNG thấy nút \"Trả lời\" — đáp án đã tick nhưng chưa gửi được.");
-      setStatus("Không thấy nút Trả lời — kiểm tra panel.");
-    } else if (conf.ok) {
-      log("✔ Đã bấm Trả lời — trang ghi nhận" + (conf.after >= 0 ? " (đã làm: " + conf.after + ")" : "") + ".");
-      setAnswer("Đã trả lời: " + finalAns.raw);
+    const conf = await clickAnswerAndConfirm(sig);
+    if (!conf.clicked) { log("⚠ KHÔNG thấy nút \"Trả lời\"."); setStatus("Không thấy nút Trả lời."); }
+    else if (conf.ok) log("✔ Đã bấm Trả lời — trang ghi nhận" + (conf.after >= 0 ? " (đã làm: " + conf.after + ")" : "") + ".");
+    else log("⚠ Bấm Trả lời nhưng chưa thấy dấu hiệu ghi nhận.");
+
+    state.doneSig = sig;
+    state.answered++;
+    await sleep(500);
+
+    // chống nhảy cóc: nếu trang đã tự chuyển câu thì không bấm Tiếp nữa
+    if (currentSignature() === sig) await advance();
+    else log("Trang tự chuyển câu.");
+  }
+
+  /* ---------- ĐIỀN TỪ ---------- */
+  async function stepFill(inputs) {
+    const sig = currentSignature();
+    if (sig !== state.lastSig) { state.lastSig = sig; state.stuck = 0; logSubmitBar(); }
+    if (sig === state.doneSig) { await advance(); return; }
+
+    if (inputs.every(i => clean(i.value).length > 0) && !state.redoDone) {
+      log("Điền từ đã có đáp án — bỏ qua theo cài đặt.");
+      state.doneSig = sig;
+      await advance();
+      return;
+    }
+
+    const stem = stemWithBlanks(inputs);
+    setStatus("Đang hỏi AI (điền từ)…");
+    const ctx = { number: getQuestionNumber(), passage: getPassage(), stem, blanks: inputs.length };
+
+    let parsed = null, usedModel = "", rawLog = "";
+    for (const model of modelChain()) {
+      try {
+        const raw = await callModel(model, buildFillMessages(ctx), 500);
+        rawLog = raw;
+        const p = parseFillAnswers(raw, inputs.length);
+        if (!p) { log("⚠ " + shortModel(model) + " điền từ không parse được: " + trunc(raw, 100)); continue; }
+        parsed = p; usedModel = model; break;
+      } catch (e) { log("✖ " + shortModel(model) + ": " + e.message); }
+    }
+    if (!parsed) { setStatus("AI chưa trả lời được (điền từ)."); log("RAW cuối: " + trunc(rawLog, 160)); return; }
+
+    rememberWorking(usedModel);
+    const shown = parsed.values.join(" | ");
+    log("AI (" + shortModel(usedModel) + ") điền từ → " + trunc(shown, 120) + " | RAW=" + trunc(rawLog, 80));
+    setAnswer("Điền: " + shown);
+
+    const before = submitBarTexts();
+    for (let i = 0; i < inputs.length; i++) { typeInto(inputs[i], parsed.values[i]); await sleep(200); }
+    await sleep(700);
+
+    for (let i = 0; i < inputs.length; i++) {
+      if (clean(inputs[i].value) !== clean(parsed.values[i])) { typeInto(inputs[i], parsed.values[i]); await sleep(200); }
+    }
+    await sleep(400);
+
+    const filledOk = inputs.every((el, i) => clean(el.value) === clean(parsed.values[i]));
+    if (!filledOk) { log("⚠ Có ô chưa nhận giá trị — thử lại sau."); setStatus("Ô điền từ chưa nhận giá trị."); return; }
+    log("Đã điền " + inputs.length + " ô: " + inputs.map(i => trunc(clean(i.value), 30)).join(" | "));
+
+    const btn = findNewAnswerButton(before) || findAnswerButton();
+    if (btn) {
+      log("Bấm nút: \"" + trunc(clean(btn.innerText || btn.getAttribute("aria-label") || "(icon)"), 24) + "\"");
+      try { btn.click(); } catch (e) {}
+      await sleep(800);
+      dismissDialog();
+      await sleep(600);
+      const after = answeredCount();
+      if (after >= 0) log("Trang ghi nhận (đã làm: " + after + ").");
     } else {
-      log("⚠ Bấm Trả lời nhưng chưa thấy dấu hiệu ghi nhận.");
+      log("Không có nút Trả lời riêng (điền từ) — chuyển câu.");
     }
 
     state.doneSig = sig;
     state.answered++;
-    await sleep(400);
-    await advance();
+    await sleep(500);
+    if (currentSignature() === sig) await advance();
+    else log("Trang tự chuyển câu.");
   }
 
+  /* ---------- TỰ LUẬN ---------- */
   async function stepEssay(ta) {
-    const sig = questionSignature([]);
+    const sig = currentSignature();
     if (sig !== state.lastSig) { state.lastSig = sig; state.stuck = 0; logSubmitBar(); }
     if (sig === state.doneSig) { await advance(); return; }
     if (questionAnsweredState() === "answered") {
@@ -719,25 +905,27 @@
     log("AI (" + shortModel(usedModel) + ") tự luận → " + trunc(text, 120));
     setAnswer(text);
 
+    const before = submitBarTexts();
     setNativeValue(ta, text);
     await sleep(500);
     if (clean(ta.value) !== clean(text)) { setNativeValue(ta, text); await sleep(400); }
-    if (clean(ta.value).length === 0) {
-      log("⚠ Chưa điền được tự luận — thử lại.");
-      setStatus("Chưa điền được ô tự luận.");
-      return;
-    }
+    if (clean(ta.value).length === 0) { log("⚠ Chưa điền được tự luận."); setStatus("Chưa điền được ô tự luận."); return; }
     log("Đã điền tự luận (" + ta.value.length + " ký tự).");
 
-    const conf = await clickAnswerAndConfirm();
-    if (!conf.clicked) log("⚠ Không thấy nút Trả lời/Lưu cho tự luận.");
-    else if (conf.ok) log("✔ Đã bấm nút tự luận — trang ghi nhận.");
-    else log("⚠ Bấm nút tự luận nhưng chưa thấy ghi nhận.");
+    const btn = findNewAnswerButton(before) || findAnswerButton();
+    if (btn) {
+      log("Bấm nút: \"" + trunc(clean(btn.innerText || btn.getAttribute("aria-label") || "(icon)"), 24) + "\"");
+      try { btn.click(); } catch (e) {}
+      await sleep(800); dismissDialog(); await sleep(500);
+    } else {
+      log("Không có nút Trả lời riêng (tự luận) — chuyển câu.");
+    }
 
     state.doneSig = sig;
     state.answered++;
-    await sleep(400);
-    await advance();
+    await sleep(500);
+    if (currentSignature() === sig) await advance();
+    else log("Trang tự chuyển câu.");
   }
 
   async function tick() {
