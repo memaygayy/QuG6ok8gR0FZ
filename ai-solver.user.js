@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         AI Solver v39.4
+// @name         AI Solver v39.5
 // @namespace    https://onluyen.vn/
-// @version      39.4.0
-// @description  Auto solve onluyen.vn (MCQ + fill + essay) - anti freeze watchdog
+// @version      39.5.0
+// @description  Auto solve onluyen.vn - robust AI + page diagnostics
 // @match        https://*.onluyen.vn/*
 // @match        https://onluyen.vn/*
 // @grant        GM_xmlhttpRequest
@@ -19,7 +19,7 @@
   "use strict";
 
   /* ================= CONFIG ================= */
-  const VERSION_STR = "39.4.0";
+  const VERSION_STR = "39.5.0";
   const GUI_ID      = "ai-solver-v38";
   const PROXY_URL   = "https://gen.pollinations.ai/v1/chat/completions";
   const POLL_KEY    = "sk_D8PP0K4jFUDUa0zjrx7uxq1XM1ZoVINK";
@@ -30,15 +30,16 @@
   const INTERVAL_KEY     = "HW_SOLVER_INTERVAL";
   const VERIFY_KEY       = "HW_SOLVER_VERIFY";
   const AUTOSUBMIT_KEY   = "HW_SOLVER_AUTO_SUBMIT";
+  const REDO_KEY         = "HW_SOLVER_REDO_DONE";
 
   const DEFAULT_MODEL  = "deepseek/deepseek-v4-flash";
-  const FALLBACK_MODELS = ["deepseek", "gemini", "openai"];
+  const FALLBACK_MODELS = ["deepseek", "openai", "openai-fast", "gemini"];
   const MODEL_CHOICES  = ["deepseek/deepseek-v4-flash", "deepseek", "gemini", "openai", "claude"];
 
   const MAX_OPTIONS   = 12;
-  const API_TIMEOUT   = 35000;   // 1 request
-  const WATCHDOG_MS   = 60000;   // không beat quá 60s -> restart loop
-  const ASK_BUDGET_MS = 110000;  // tổng ngân sách 1 lần hỏi AI
+  const API_TIMEOUT   = 35000;
+  const WATCHDOG_MS   = 60000;
+  const ASK_BUDGET_MS = 110000;
 
   const BAD_BTN_RE    = /(bỏ qua|skip|nộp bài|nộp|xác nhận nộp|hủy|huỷ|cancel|thoát|đóng|close|báo lỗi)/i;
   const NEXT_RE       = /(câu tiếp|câu sau|tiếp theo|câu kế|kế tiếp|next)/i;
@@ -56,6 +57,7 @@
 
   const beat = () => { state.lastBeat = Date.now(); };
   const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms | 0)));
+  const alive = (myGen) => state.running && myGen === state.gen;
 
   /* ================= LOG ================= */
   let logEl = null, statusEl = null, answerEl = null;
@@ -68,7 +70,7 @@
     const d = document.createElement("div");
     d.textContent = line;
     logEl.appendChild(d);
-    while (logEl.childNodes.length > 120) logEl.removeChild(logEl.firstChild);
+    while (logEl.childNodes.length > 150) logEl.removeChild(logEl.firstChild);
     logEl.scrollTop = logEl.scrollHeight;
   }
 
@@ -89,39 +91,60 @@
   }
 
   function isNoteArea(el) {
-    return !!(el && el.closest && (el.closest(".popupNoteV2") || el.closest("#test-step-questionnoteTextarea")));
+    if (!el || !el.closest) return false;
+    return !!(el.closest(".popupNoteV2") || el.closest("#test-step-questionnoteTextarea"));
   }
 
-  function qRoot() { return $("#test-step-question") || document; }
+  // CRITICAL: NEVER return `document`. Only return the real question container or null.
+  function qRoot() {
+    return $("#test-step-question")
+        || $(".test-step-question")
+        || $("app-test-school-step-data-regular .question-container")
+        || $("app-test-school-step-data-regular")
+        || null;
+  }
+
+  function qRootDiag() {
+    const tries = ["#test-step-question", ".test-step-question",
+                   ".question-container", "app-test-school-step-data-regular"];
+    return tries.map((s) => s + "=" + ($(s) ? "✓" : "✗")).join(" ");
+  }
 
   function getOptions() {
-    return $$("#test-step-question div.question-option").filter((el) => !insideGui(el));
+    const root = qRoot();
+    if (!root) return [];
+    return $$("#test-step-question div.question-option, .question-container div.question-option", root)
+      .filter((el) => !insideGui(el));
   }
 
   function getFillInputs() {
-    return $$('input[type="text"], input:not([type])', qRoot()).filter((el) =>
+    const root = qRoot();
+    if (!root) return [];
+    return $$('input[type="text"], input:not([type])', root).filter((el) =>
       !insideGui(el) && !isNoteArea(el) && !el.disabled && !el.readOnly &&
       !el.closest(".answer-sheet") && isVisible(el)
     );
   }
 
   function getEssayTextareas() {
-    return $$("textarea", qRoot()).filter((el) =>
+    const root = qRoot();
+    if (!root) return [];
+    return $$("textarea", root).filter((el) =>
       !insideGui(el) && !el.disabled && !el.readOnly && !isNoteArea(el) &&
       el.id !== "test-step-questiontextarea" && isVisible(el)
     );
   }
 
   function getStemText() {
-    const host = $("#test-step-question .question-name") || $("#step .question-name");
-    const ctx  = $("#test-step-question .question-text");
+    const host = $("#test-step-question .question-name") || $(".question-name");
+    const ctx  = $("#test-step-question .question-text") || $(".question-text");
     const a = host ? (host.innerText || host.textContent || "") : "";
     const b = ctx  ? (ctx.innerText  || ctx.textContent  || "") : "";
     return (a + "\n" + b).replace(/\n{3,}/g, "\n\n").trim().slice(0, 3000);
   }
 
   function stemWithBlanks(inputs) {
-    const host = $("#test-step-question .question-name") || $("#step .question-name");
+    const host = $("#test-step-question .question-name") || $(".question-name");
     if (!host) return getStemText();
     const clone = host.cloneNode(true);
     const cloneInputs = $$('input[type="text"], input:not([type])', clone)
@@ -144,7 +167,7 @@
   }
 
   function currentSignature() {
-    const num = $("#test-step-question .question-header .num");
+    const num = $("#test-step-question .question-header .num") || $(".question-header .num");
     const id  = num ? (num.textContent || "").trim().replace(/\s+/g, " ") : "";
     const st  = getStemText().slice(0, 80);
     return id + "|" + st;
@@ -162,13 +185,23 @@
 
   /* ================= TRANSPORT ================= */
   function extractContent(text) {
+    let j = null;
+    try { j = JSON.parse(text); } catch (e) {}
+    if (j && typeof j === "object") {
+      if (j.error) return "";
+      const c = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+      if (typeof c === "string" && c.trim()) return c.trim();
+      return "";
+    }
+    if (typeof text === "string" && text.trim() && text.trim()[0] !== "{") return text.trim();
+    return "";
+  }
+
+  function extractError(text) {
     try {
       const j = JSON.parse(text);
-      const c = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
-      if (typeof c === "string" && c.trim()) return c.trim();
-      if (typeof j === "string") return j;
+      if (j && j.error) return String(j.error).slice(0, 140);
     } catch (e) {}
-    if (typeof text === "string" && text.trim() && text.trim()[0] !== "{") return text.trim();
     return "";
   }
 
@@ -196,7 +229,11 @@
         GM_xmlhttpRequest({
           method: "POST",
           url: url,
-          headers: { "Content-Type": "application/json", "Authorization": "Bearer " + POLL_KEY },
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + POLL_KEY,
+            "Accept": "application/json"
+          },
           data: body,
           timeout: ms,
           onload:    (r) => done({ ok: r.status >= 200 && r.status < 300, status: r.status, text: r.responseText }),
@@ -224,6 +261,8 @@
     try { if (localStorage.getItem(MODEL_WORKING) !== m) localStorage.setItem(MODEL_WORKING, m); } catch (e) {}
   }
 
+  let rawLogCount = 0;
+
   async function askAI(messages) {
     const models = modelChain();
     const deadline = Date.now() + ASK_BUDGET_MS;
@@ -232,24 +271,28 @@
     for (let mi = 0; mi < models.length; mi++) {
       if (Date.now() > deadline) { lastErr = "budget-exceeded"; break; }
       const model = models[mi];
-      const body = JSON.stringify({
-        model: model,
-        messages: messages,
-        temperature: 0.2,
-        max_tokens: 800,
-        private: true,
-        referrer: "onluyen-solver",
-      });
 
-      for (let attempt = 0; attempt < 2; attempt++) {
+      for (let attempt = 0; attempt < 3; attempt++) {
         if (Date.now() > deadline) { lastErr = "budget-exceeded"; break; }
         beat();
 
-        let r = await fetchJSON(PROXY_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": "Bearer " + POLL_KEY },
-          body: body,
-        }, API_TIMEOUT);
+        const payload = {
+          model: model,
+          messages: messages,
+          temperature: 0.2,
+          max_tokens: 800,
+          stream: false,
+        };
+        if (attempt === 0) { payload.private = true; payload.referrer = "onluyen-solver"; }
+
+        const body = JSON.stringify(payload);
+        const headers = {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + POLL_KEY,
+          "Accept": "application/json",
+        };
+
+        let r = await fetchJSON(PROXY_URL, { method: "POST", headers: headers, body: body }, API_TIMEOUT);
 
         if (!r || !r.ok || !r.text) {
           beat();
@@ -259,21 +302,30 @@
         }
 
         if (r && r.ok && r.text) {
-          const txt = extractContent(r.text);
-          if (txt) {
-            setWorkingModel(model);
-            log("AI (" + model + ") OK");
-            return { ok: true, text: txt, model: model };
+          const errMsg = extractError(r.text);
+          if (errMsg) {
+            lastErr = "API: " + errMsg;
+          } else {
+            const txt = extractContent(r.text);
+            if (txt) {
+              setWorkingModel(model);
+              log("AI (" + model + ") OK");
+              return { ok: true, text: txt, model: model };
+            }
+            lastErr = "empty";
+            if (rawLogCount < 3) {
+              rawLogCount++;
+              log("RAW (rỗng) [" + model + "]: " + (r.text || "").slice(0, 220));
+            }
           }
-          lastErr = "empty";
         } else if (r && r.error) {
           lastErr = r.error;
         } else if (r && r.status) {
           lastErr = "HTTP " + r.status;
         }
 
-        log("↻ Thử lại model " + model + " (lỗi: " + lastErr + ")");
-        await sleep(500);
+        log("↻ " + model + " lần " + (attempt + 1) + "/3 (lỗi: " + lastErr + ")");
+        await sleep(600);
       }
     }
     return { ok: false, error: lastErr };
@@ -498,7 +550,7 @@
   }
 
   function hasQuestion() {
-    if (!$("#test-step-question")) return false;
+    if (!qRoot()) return false;
     if (getOptions().length) return true;
     if (getFillInputs().length) return true;
     if (getEssayTextareas().length) return true;
@@ -506,7 +558,8 @@
   }
 
   /* ================= STEPS ================= */
-  async function stepMcq(opts) {
+  async function stepMcq(opts, myGen) {
+    if (!alive(myGen)) return;
     const sig = currentSignature();
     logSubmitBar();
     log("Tìm thấy " + opts.length + " đáp án | " + sig.slice(0, 60));
@@ -515,23 +568,27 @@
     const stem = getStemText();
 
     const res = await askAI(buildMcqMessages(opts));
-    if (!res.ok) { log("❌ AI lỗi: " + res.error + " — thử lại sau 3s."); await sleep(3000); return; }
+    if (!alive(myGen)) return;
+    if (!res.ok) { log("❌ AI lỗi: " + res.error + " — thử lại sau 5s."); await sleep(5000); return; }
 
     const pick = parseAnswerObj(res.text, opts);
-    if (!pick) { log("❌ Không đọc được đáp án AI: " + res.text.slice(0, 80)); await sleep(2500); return; }
+    if (!pick) { log("❌ Không đọc được đáp án: " + res.text.slice(0, 100)); await sleep(3000); return; }
 
     log("AI chọn " + pick.letter + " · " + (pick.explain || "").slice(0, 90));
     showAnswer(pick.letter + ". " + optionText(opts[pick.index]).slice(0, 120));
 
     let ok = await applyAnswer(pick.index);
+    if (!alive(myGen)) return;
     log(ok ? ("Đã tick " + pick.letter + ".") : ("⚠ Không tick được " + pick.letter + " — thử lại."));
     if (!ok) ok = await applyAnswer(pick.index);
 
     const verifyN = getVerifyCount();
     for (let v = 0; v < verifyN; v++) {
+      if (!alive(myGen)) return;
       beat();
       const chosen = optionLabel(opts[pick.index]) + ". " + optionText(opts[pick.index]);
       const vr = await askAI(buildVerifyMessages(stem, chosen));
+      if (!alive(myGen)) return;
       if (!vr.ok) { log("… kiểm tra " + (v + 1) + " bỏ qua (" + vr.error + ")"); continue; }
       let needFix = false;
       try {
@@ -541,7 +598,7 @@
       if (needFix) {
         const np = parseAnswerObj(vr.text, opts);
         if (np && np.index !== pick.index) {
-          log("↻ Kiểm tra thấy sai — đổi sang " + np.letter);
+          log("↻ Kiểm tra sai — đổi sang " + np.letter);
           pick.index = np.index; pick.letter = np.letter;
           await applyAnswer(pick.index);
           continue;
@@ -551,6 +608,7 @@
     }
 
     const btn = await findNewAnswerButton(before);
+    if (!alive(myGen)) return;
     if (btn) {
       const t = (btn.textContent || "").trim();
       btn.click();
@@ -567,7 +625,8 @@
     setStatus("Đã làm " + state.answered + " câu");
   }
 
-  async function stepFill(inputs) {
+  async function stepFill(inputs, myGen) {
+    if (!alive(myGen)) return;
     const sig = currentSignature();
     logSubmitBar();
     log("Phát hiện " + inputs.length + " ô điền từ.");
@@ -575,7 +634,8 @@
     const stem = stemWithBlanks(inputs);
 
     const res = await askAI(buildFillMessages(stem, inputs.length));
-    if (!res.ok) { log("❌ AI lỗi: " + res.error + " — thử lại sau 3s."); await sleep(3000); return; }
+    if (!alive(myGen)) return;
+    if (!res.ok) { log("❌ AI lỗi: " + res.error + " — thử lại sau 5s."); await sleep(5000); return; }
 
     const answers = parseFillAnswers(res.text, inputs.length);
     log("AI điền từ → " + answers.join(" | "));
@@ -590,9 +650,10 @@
     log("Đã điền " + filled + "/" + inputs.length + " ô.");
     showAnswer(answers.filter(Boolean).join(" | "));
 
-    if (!filled) { log("⚠ Không điền được ô nào — bỏ qua câu này."); await advance(); return; }
+    if (!filled) { log("⚠ Không điền được ô nào — chuyển câu."); await advance(); return; }
 
     const btn = await findNewAnswerButton(before);
+    if (!alive(myGen)) return;
     if (btn) {
       const t = (btn.textContent || "").trim();
       btn.click();
@@ -609,7 +670,8 @@
     setStatus("Đã làm " + state.answered + " câu");
   }
 
-  async function stepEssay(areas) {
+  async function stepEssay(areas, myGen) {
+    if (!alive(myGen)) return;
     const sig = currentSignature();
     logSubmitBar();
     log("Phát hiện " + areas.length + " ô tự luận.");
@@ -617,10 +679,11 @@
     const stem = getStemText();
 
     const res = await askAI(buildEssayMessages(stem));
-    if (!res.ok) { log("❌ AI lỗi: " + res.error + " — thử lại sau 3s."); await sleep(3000); return; }
+    if (!alive(myGen)) return;
+    if (!res.ok) { log("❌ AI lỗi: " + res.error + " — thử lại sau 5s."); await sleep(5000); return; }
 
     const bare = extractBareAnswer(res.text);
-    if (!bare) { log("❌ AI trả về rỗng."); await sleep(2500); return; }
+    if (!bare) { log("❌ AI trả về rỗng."); await sleep(3000); return; }
     log("AI tự luận → " + bare.slice(0, 120));
     showAnswer(bare.slice(0, 200));
 
@@ -629,6 +692,7 @@
     log(ok ? ("Đã điền tự luận (" + bare.length + " ký tự).") : "⚠ Không điền được tự luận.");
 
     const btn = await findNewAnswerButton(before);
+    if (!alive(myGen)) return;
     if (btn) {
       const t = (btn.textContent || "").trim();
       btn.click();
@@ -645,7 +709,7 @@
     setStatus("Đã làm " + state.answered + " câu");
   }
 
-  /* ================= LOOP + WATCHDOG ================= */
+  /* ================= LOOP ================= */
   function getInterval() {
     const v = parseInt(localStorage.getItem(INTERVAL_KEY) || "2500", 10);
     return isNaN(v) ? 2500 : Math.max(1200, v);
@@ -660,15 +724,35 @@
     beat();
     log("▶ Vòng lặp bắt đầu (gen " + myGen + ")");
 
+    let noQ = 0;
+
     while (state.running && myGen === state.gen) {
       try {
         beat();
 
         if (!hasQuestion()) {
-          log("Chưa thấy câu hỏi (trang đang tải)... chờ.");
+          noQ++;
+          if (noQ === 1 || noQ % 5 === 0) {
+            log("⏳ Chưa thấy câu hỏi (" + noQ + "/20) · " + qRootDiag());
+          }
+          if (noQ >= 20) {
+            log("⚠ 30s không có câu hỏi — thử chuyển câu.");
+            noQ = 0;
+            const moved = await advance();
+            if (!alive(myGen)) return;
+            if (!moved) {
+              log("❌ Không chuyển được câu — dừng. (Hard reload Ctrl+Shift+R rồi thử lại)");
+              state.running = false;
+              setStatus("Trang không có câu hỏi");
+              break;
+            }
+            await sleep(1500);
+            continue;
+          }
           await sleep(1500);
           continue;
         }
+        noQ = 0;
 
         const sig = currentSignature();
         if (sig === state.lastSig) state.sameCount++;
@@ -678,23 +762,21 @@
           log("⚠ Kẹt ở câu này 3 lần — thử chuyển câu.");
           state.sameCount = 0;
           const moved = await advance();
+          if (!alive(myGen)) return;
           if (!moved) { log("⚠ Không chuyển được câu — dừng."); state.running = false; setStatus("Hết câu / không chuyển được"); break; }
           await sleep(1200);
           continue;
         }
 
-        const opts = getOptions();
-        if (opts.length)            await stepMcq(opts);
-        else {
-          const fills = getFillInputs();
-          if (fills.length)         await stepFill(fills);
-          else {
-            const areas = getEssayTextareas();
-            if (areas.length)       await stepEssay(areas);
-            else { log("Không xác định được dạng câu — chờ."); await sleep(1500); continue; }
-          }
-        }
+        const opts  = getOptions();
+        const fills = opts.length ? [] : getFillInputs();
+        const areas = (opts.length || fills.length) ? [] : getEssayTextareas();
 
+        if (opts.length)        await stepMcq(opts, myGen);
+        else if (fills.length)  await stepFill(fills, myGen);
+        else if (areas.length)  await stepEssay(areas, myGen);
+
+        if (!alive(myGen)) return;
         await sleep(getInterval());
       } catch (err) {
         log("❌ Lỗi vòng lặp: " + (err && err.message ? err.message : String(err)));
@@ -703,10 +785,6 @@
     }
 
     log("■ Vòng lặp dừng (gen " + myGen + ")");
-    if (state.running && myGen === state.gen) {
-      // thoát bất thường -> tự chạy lại
-      setTimeout(() => { if (state.running) loop(); }, 500);
-    }
   }
 
   setInterval(() => {
@@ -725,13 +803,66 @@
     else { beat(); log("Tab hiện lại — tiếp tục."); }
   });
 
+  /* ================= DIAGNOSTICS ================= */
+  function checkPage() {
+    log("=== KIỂM TRA TRANG ===");
+    log("URL: " + location.href);
+    ["#test-step-question",".test-step-question",".question-container",".question-name",
+     ".question-option",".submit-bar",".answer-sheet",".mobile-bottom-bar",".question-text"].forEach((s) => {
+      const els = $$(s);
+      log("  " + s + ": " + (els.length ? ("×" + els.length) : "✗"));
+    });
+    const opts = getOptions();
+    log("  Options: " + opts.length + (opts.length ? " (" + opts.map(optionLabel).join(",") + ")" : ""));
+    log("  Fill inputs: " + getFillInputs().length);
+    log("  Essay textareas: " + getEssayTextareas().length);
+    const bar = submitBarTexts();
+    log("  Submit-bar: " + (bar.length ? "[" + bar.join("] [") + "]" : "(trống)"));
+    const sheet = $$(".answer-sheet .option");
+    const done = sheet.filter((o) => o.classList.contains("done")).length;
+    const aIdx = sheet.findIndex((o) => o.classList.contains("active"));
+    log("  Answer-sheet: " + sheet.length + " (done: " + done + ", active: #" + (aIdx >= 0 ? (aIdx + 1) : "?") + ")");
+    const stem = getStemText();
+    log("  Stem: " + (stem ? stem.slice(0, 120).replace(/\s+/g, " ") : "(trống)"));
+    log("======================");
+  }
+
+  async function testAI() {
+    log("=== TEST AI ===");
+    const model = localStorage.getItem(MODEL_CUSTOM_KEY) || localStorage.getItem(MODEL_KEY) || DEFAULT_MODEL;
+    log("Model: " + model);
+    const body = JSON.stringify({
+      model: model,
+      messages: [{ role: "user", content: "Respond exactly with the word OK" }],
+      temperature: 0.1,
+      max_tokens: 20,
+      stream: false
+    });
+    const headers = {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer " + POLL_KEY,
+      "Accept": "application/json",
+    };
+    log("Gửi request...");
+    let r = await fetchJSON(PROXY_URL, { method: "POST", headers: headers, body: body }, API_TIMEOUT);
+    if (!r || !r.ok || !r.text) {
+      const g = await gmRequest(PROXY_URL, body, API_TIMEOUT);
+      if (g && (g.text || g.error)) r = g;
+    }
+    log("Status: " + (r && (r.status || r.error || "?")));
+    log("RAW: " + ((r && r.text) || "(rỗng)").slice(0, 320));
+    const ext = r && r.text ? extractContent(r.text) : "";
+    log("Extracted: " + (ext || "(rỗng)"));
+    log("======================");
+  }
+
   /* ================= GUI ================= */
   function buildGui() {
     if (document.getElementById(GUI_ID)) return;
 
     const style = document.createElement("style");
     style.textContent = [
-      "#" + GUI_ID + "{position:fixed;top:12px;right:12px;width:330px;max-height:86vh;z-index:2147483647;",
+      "#" + GUI_ID + "{position:fixed;top:12px;right:12px;width:340px;max-height:86vh;z-index:2147483647;",
       "background:#0f172a;color:#e2e8f0;font:12px/1.45 system-ui,Segoe UI,Arial;border:1px solid #334155;",
       "border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.45);display:flex;flex-direction:column;overflow:hidden}",
       "#" + GUI_ID + " .ais-head{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;",
@@ -744,14 +875,16 @@
       "border:1px solid #334155;border-radius:6px;padding:4px 6px;font-size:12px}",
       "#" + GUI_ID + " .ais-check{display:flex;align-items:center;gap:6px;font-size:11px;color:#cbd5e1}",
       "#" + GUI_ID + " .ais-actions{display:flex;gap:6px;margin-top:2px}",
-      "#" + GUI_ID + " .ais-actions button{flex:1;padding:6px;border:0;border-radius:8px;cursor:pointer;font-weight:600}",
+      "#" + GUI_ID + " .ais-actions button{flex:1;padding:6px;border:0;border-radius:8px;cursor:pointer;font-weight:600;font-size:11px}",
       "#" + GUI_ID + " .ais-start{background:#16a34a;color:#fff}",
       "#" + GUI_ID + " .ais-stop{background:#dc2626;color:#fff}",
+      "#" + GUI_ID + " .ais-check-b{background:#2563eb;color:#fff}",
+      "#" + GUI_ID + " .ais-test-b{background:#9333ea;color:#fff}",
       "#" + GUI_ID + " .ais-status{color:#94a3b8;font-size:11px}",
       "#" + GUI_ID + " .ais-answer{background:#052e16;border:1px solid #166534;color:#bbf7d0;border-radius:8px;",
       "padding:6px;min-height:20px;word-break:break-word}",
       "#" + GUI_ID + " .ais-log{background:#020617;border:1px solid #1e293b;border-radius:8px;padding:6px;",
-      "height:150px;overflow:auto;font:11px/1.4 ui-monospace,Consolas,monospace;color:#94a3b8;white-space:pre-wrap}",
+      "height:160px;overflow:auto;font:11px/1.4 ui-monospace,Consolas,monospace;color:#94a3b8;white-space:pre-wrap}",
       "#" + GUI_ID + " .ais-foot{padding:6px 10px;background:#1e293b;color:#64748b;font-size:10px;text-align:center}",
       "#" + GUI_ID + ".ais-collapsed .ais-body,#" + GUI_ID + ".ais-collapsed .ais-foot{display:none}",
     ].join("");
@@ -760,7 +893,7 @@
     const box = document.createElement("div");
     box.id = GUI_ID;
     box.innerHTML =
-      '<div class="ais-head"><span class="ais-title">⚡ ai slover v39.4</span>' +
+      '<div class="ais-head"><span class="ais-title">⚡ ai slover v39.5</span>' +
       '<button class="ais-min" title="Thu nhỏ">–</button></div>' +
       '<div class="ais-body">' +
         '<label class="ais-row">Model<select class="ais-model"></select></label>' +
@@ -770,11 +903,12 @@
         '<label class="ais-check"><input class="ais-redo" type="checkbox"> Làm lại câu đã đúng</label>' +
         '<label class="ais-check"><input class="ais-autosubmit" type="checkbox"> Tự nộp bài khi hết câu (nguy hiểm)</label>' +
         '<div class="ais-actions"><button class="ais-start">▶ Start</button><button class="ais-stop">■ Stop</button></div>' +
+        '<div class="ais-actions"><button class="ais-check-b">🔍 Check page</button><button class="ais-test-b">🧪 Test AI</button></div>' +
         '<div class="ais-status">Chưa chạy</div>' +
         '<div class="ais-answer" id="ais-answer">—</div>' +
         '<div class="ais-log" id="ais-log"></div>' +
       '</div>' +
-      '<div class="ais-foot">v39.4 · điền từ (input) · chống nhảy cóc · chống treo (watchdog 60s)</div>';
+      '<div class="ais-foot">v39.5 · chống treo 60s · AI raw-log · qRoot null-safe · nút Check/Test</div>';
 
     document.body.appendChild(box);
 
@@ -828,9 +962,9 @@
     });
 
     const redo = $(".ais-redo", box);
-    redo.checked = localStorage.getItem("HW_SOLVER_REDO_DONE") !== "0";
+    redo.checked = localStorage.getItem(REDO_KEY) !== "0";
     redo.addEventListener("change", () => {
-      localStorage.setItem("HW_SOLVER_REDO_DONE", redo.checked ? "1" : "0");
+      localStorage.setItem(REDO_KEY, redo.checked ? "1" : "0");
     });
 
     const auto = $(".ais-autosubmit", box);
@@ -842,9 +976,10 @@
 
     $(".ais-start", box).addEventListener("click", start);
     $(".ais-stop", box).addEventListener("click", stop);
+    $(".ais-check-b", box).addEventListener("click", checkPage);
+    $(".ais-test-b", box).addEventListener("click", testAI);
     $(".ais-min", box).addEventListener("click", () => box.classList.toggle("ais-collapsed"));
 
-    // drag
     const head = $(".ais-head", box);
     let dragging = false, ox = 0, oy = 0;
     head.addEventListener("mousedown", (e) => {
@@ -867,7 +1002,7 @@
 
   function start() {
     if (state.running) { log("Đang chạy rồi."); return; }
-    buildGui();
+    if (!qRoot()) log("⚠ Chưa thấy container câu hỏi — chờ trang render.");
     state.running = true;
     state.lastSig = "";
     state.sameCount = 0;
@@ -891,6 +1026,7 @@
     buildGui();
     log("VERSION " + VERSION_STR + " booted at " + new Date().toISOString());
     log("URL: " + location.href);
+    log("qRoot: " + (qRoot() ? "có container" : "chưa thấy (trang đang tải?)"));
   }
 
   if (document.readyState === "loading") {
