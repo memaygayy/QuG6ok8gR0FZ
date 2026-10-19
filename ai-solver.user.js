@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         AI Solver v38.7
+// @name         AI Solver v38.8
 // @namespace    https://github.com/memaygayy/QuG6ok8gR0FZ
-// @version      38.7.0
-// @description  Auto solve onluyen.vn — .question-option, không bấm "Bỏ qua"/"Nộp Bài"
+// @version      38.8.0
+// @description  Auto solve onluyen.vn — .question-option, không bấm Bỏ qua/Nộp Bài, chống toggle-off
 // @author       memaygayy
 // @match        https://*.onluyen.vn/*
 // @grant        GM_xmlhttpRequest
@@ -19,6 +19,9 @@
   "use strict";
   if (window.__AI_SOLVER_V38__) return;
   window.__AI_SOLVER_V38__ = true;
+
+  const VERSION_STR = "38.8.0";
+  try { console.log("[AI-SOLVER] VERSION " + VERSION_STR + " booted at " + new Date().toISOString()); } catch (e) {}
 
   /* ================= CONFIG ================= */
   const GUI_ID    = "ai-solver-v38";
@@ -37,8 +40,6 @@
   const MODEL_CHOICES    = ["deepseek/deepseek-v4-flash", "deepseek", "gemini", "openai", "claude"];
 
   const MAX_OPTIONS      = 12;
-  const RE_CHECK_ROUNDS  = 3;
-  const MAX_ANSWER_RETRY = 2;
   const API_TIMEOUT      = 35000;
   const NEXT_WAIT        = 8000;
   const QUESTION_WAIT_MS = 20000;
@@ -51,6 +52,8 @@
     timers: [], advanceFail: 0, answered: 0, idleTicks: 0
   };
   let TRANSPORT = null;
+  let clickedOptions = new WeakSet();  // element đã click 1 lần — không click lại để tránh toggle off
+  let lastSolvedSig = "";
 
   /* ================= GETTERS ================= */
   function getInterval()    { const v = parseInt(localStorage.getItem(INTERVAL_KEY), 10); return (isNaN(v) || v < 1200) ? 3500 : v; }
@@ -78,11 +81,11 @@
 
   function insideChrome(el) {
     if (!el || !el.closest) return false;
-    if (el.closest("#" + GUI_ID))       return true;
-    if (el.closest(".answer-sheet"))    return true;
+    if (el.closest("#" + GUI_ID))         return true;
+    if (el.closest(".answer-sheet"))      return true;
     if (el.closest(".mobile-bottom-bar")) return true;
-    if (el.closest(".left-side"))       return true;
-    if (el.closest(".submit-bar"))      return true;
+    if (el.closest(".left-side"))         return true;
+    if (el.closest(".submit-bar"))        return true;
     return false;
   }
 
@@ -323,19 +326,17 @@
   function selectOption(el) {
     if (!el) return false;
     if (isOptionSelected(el)) return true;
+    if (clickedOptions.has(el)) return true;   // đã click rồi, không toggle lại
 
-    // click thẳng vào khối đáp án (site bind event ở đây)
     clickEl(el);
+    clickedOptions.add(el);
     if (isOptionSelected(el)) return true;
 
     const input = el.querySelector('input[type="radio"], input[type="checkbox"]');
-    if (input) {
-      try { input.click(); } catch (e) {}
-      if (!input.checked) {
-        setNativeChecked(input, true);
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-        input.dispatchEvent(new Event("change", { bubbles: true }));
-      }
+    if (input && !input.checked) {
+      setNativeChecked(input, true);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
     }
     return isOptionSelected(el);
   }
@@ -371,7 +372,6 @@
   }
 
   function getStem(options) {
-    // 1) onluyen school-test: .question-name (+ đoạn văn .question-text)
     const qn = document.querySelector("#test-step-question .question-name") || document.querySelector(".question-name");
     if (qn) {
       const parts = [];
@@ -383,7 +383,6 @@
       if (out.length >= 5) return out.slice(0, 2500);
     }
 
-    // 2) generic
     if (!options || !options.length) return "";
     const optTexts = options.map(optionText).filter(t => t.length);
 
@@ -445,7 +444,6 @@
   const NEXT_RE = /(câu tiếp|tiếp theo|câu sau|câu kế|kế tiếp|next)/i;
 
   function findNextNav() {
-    // 1) chevron phải ở thanh mobile
     const bar = document.querySelector(".mobile-bottom-bar");
     if (bar) {
       const btns = Array.from(bar.querySelectorAll("button.nav-btn"));
@@ -455,16 +453,13 @@
         if (isRight && !b.querySelector(".fa-chevron-left") && !isDisabled(b) && isVisible(b)) return b;
       }
     }
-    // 2) ô số kế tiếp trong phiếu trả lời
     const p = getProgress();
     if (p && p.active >= 0 && p.active + 1 < p.list.length) return p.list[p.active + 1];
-    // 3) chevron bất kỳ
     const all = document.querySelectorAll(".nav-btn");
     for (let i = 0; i < all.length; i++) {
       const b = all[i];
       if (b.querySelector(".fa-chevron-right, .fa-angle-right") && !isDisabled(b)) return b;
     }
-    // 4) nút chữ "Tiếp"
     const nodes = document.querySelectorAll('button, a, [role="button"]');
     for (let i = 0; i < nodes.length; i++) {
       const n = nodes[i];
@@ -490,41 +485,53 @@
     return null;
   }
 
-  /* ================= APPLY + VERIFY ================= */
+  function detectFeedback(options) {
+    const correct = new Set(), wrong = new Set();
+    const OK  = ["correct", "true", "right", "success", "dung", "đúng", "answer-correct", "is-correct"];
+    const BAD = ["incorrect", "wrong", "false", "error", "sai", "answer-wrong", "is-wrong", "is-incorrect"];
+    options.forEach((o, i) => {
+      const cls = (typeof o.className === "string" ? o.className : "").toLowerCase();
+      const parts = cls.split(/\s+/).filter(Boolean);
+      if (parts.some(p => OK.indexOf(p) >= 0))  correct.add(i);
+      if (parts.some(p => BAD.indexOf(p) >= 0)) wrong.add(i);
+    });
+    return { correct: correct, wrong: wrong };
+  }
+
+  /* ================= APPLY: 1 CLICK / OPTION, KHÔNG TOGGLE OFF ================= */
   async function applySelection(indices) {
     const before = getAnsweredCount();
-
     let opts = getOptionNodes();
     if (!opts.length) return false;
+
+    let newlyClicked = 0, alreadyOk = 0;
     for (let k = 0; k < indices.length; k++) {
       const el = opts[indices[k]];
-      if (el && !isOptionSelected(el)) selectOption(el);
+      if (!el) continue;
+      if (isOptionSelected(el)) { alreadyOk++; continue; }
+      if (clickedOptions.has(el)) { alreadyOk++; continue; }
+      if (selectOption(el)) newlyClicked++;
+      await sleep(180);
     }
-    await sleep(450);
+    if (newlyClicked > 0) await sleep(450);
 
-    for (let round = 1; round <= RE_CHECK_ROUNDS; round++) {
-      opts = getOptionNodes();
-      let ok = 0;
-      for (let k = 0; k < indices.length; k++) {
-        const el = opts[indices[k]];
-        if (el && isOptionSelected(el)) ok++;
-      }
-      if (ok === indices.length) return true;
+    opts = getOptionNodes();
+    let ok = 0;
+    for (let k = 0; k < indices.length; k++) {
+      const el = opts[indices[k]];
+      if (el && isOptionSelected(el)) ok++;
+    }
+    if (ok === indices.length) return true;
 
-      const now = getAnsweredCount();
-      if (before !== null && now !== null && now > before) {
-        log("Site ghi nhận đáp án (bộ đếm " + before + " → " + now + ")", "ok");
-        return true;
-      }
-      if (round >= RE_CHECK_ROUNDS) break;
+    const now = getAnsweredCount();
+    if (before !== null && now !== null && now > before) {
+      log("Site ghi nhận (" + before + " → " + now + ")", "ok");
+      return true;
+    }
 
-      // chỉ click lại những cái CHƯA chọn
-      for (let k = 0; k < indices.length; k++) {
-        const el = opts[indices[k]];
-        if (el && !isOptionSelected(el)) selectOption(el);
-      }
-      await sleep(300 * round);
-      log("Kiểm tra lại " + round + "/" + RE_CHECK_ROUNDS + " (" + ok + "/" + indices.length + " đã chọn)", "warn");
+    if (ok + newlyClicked >= indices.length) {
+      if (newlyClicked > 0) log("Đã click " + indices.length + " đáp án (tin tưởng click, không toggle lại)", "warn");
+      return true;
     }
     return false;
   }
@@ -536,7 +543,7 @@
     if (!anySelected) { log("Chưa chọn được đáp án nào — KHÔNG bấm nộp.", "warn"); return false; }
 
     const btn = findCheckButton();
-    if (!btn) return false;   // trang này không có nút kiểm tra từng câu
+    if (!btn) return false;
     clickEl(btn);
     log("Đã bấm nút kiểm tra", "ok");
     return true;
@@ -576,7 +583,6 @@
     if (nav && !isDisabled(nav)) {
       clickEl(nav);
       if (await waitForChange(prevSig, NEXT_WAIT)) return true;
-
       const again = findNextNav();
       if (again && !isDisabled(again) && again !== nav) {
         clickEl(again);
@@ -652,6 +658,8 @@
     const qno      = getQuestionNo();
     const sig      = hashStr(qno + "||" + stem + "||" + optTexts.join("|"));
 
+    if (sig !== lastSolvedSig) { clickedOptions = new WeakSet(); lastSolvedSig = sig; }
+
     log("Câu " + (qno || "?") + " · " + options.length + " đáp án · " + stem.slice(0, 80).replace(/\n/g, " "));
 
     if (state.solvedSigs.has(sig)) {
@@ -671,7 +679,6 @@
     }
 
     if (!getReSolveDone()) {
-      const cnt = getAnsweredCount();
       const p = getProgress();
       const already = (p && p.active >= 0 && /(^|\s)(done|answered)(\s|$)/i.test(p.list[p.active].className)) ||
                       options.some(isOptionSelected);
@@ -709,23 +716,23 @@
     let attempt = 0;
     let solvedOk = false;
 
-    while (attempt <= MAX_ANSWER_RETRY) {
+    while (attempt <= 2) {
       setStatus("Đang chọn đáp án...");
       const applied = await applySelection(indices);
       if (!applied) log("Chưa xác nhận được đáp án.", "warn");
 
       let fb = detectFeedback(getOptionNodes());
-
       if (fb.wrong.size && indices.some(i => fb.wrong.has(i))) {
         prevWrong = prevWrong.concat(indices.map(i => String.fromCharCode(65 + i)));
         attempt++;
-        if (attempt > MAX_ANSWER_RETRY) break;
+        if (attempt > 2) break;
         setStatus("Sai — xin đáp án khác...");
         const nxt = await reAsk(stem, optTexts, prevWrong);
         if (!nxt.length) break;
         indices = nxt.filter(i => prevWrong.indexOf(String.fromCharCode(65 + i)) < 0);
         if (!indices.length) indices = nxt;
         state.cache.set(sig, indices.slice());
+        clickedOptions = new WeakSet();   // reset để có thể chọn lại
         continue;
       }
       if (fb.correct.size) { log("Đã đúng.", "ok"); solvedOk = true; break; }
@@ -738,13 +745,14 @@
       if (fb.wrong.size && indices.some(i => fb.wrong.has(i))) {
         prevWrong = prevWrong.concat(indices.map(i => String.fromCharCode(65 + i)));
         attempt++;
-        if (attempt > MAX_ANSWER_RETRY) break;
+        if (attempt > 2) break;
         setStatus("Sai — chọn lại...");
         const nxt = await reAsk(stem, optTexts, prevWrong);
         if (!nxt.length) break;
         indices = nxt.filter(i => prevWrong.indexOf(String.fromCharCode(65 + i)) < 0);
         if (!indices.length) indices = nxt;
         state.cache.set(sig, indices.slice());
+        clickedOptions = new WeakSet();
         continue;
       }
       solvedOk = true;
@@ -755,19 +763,6 @@
 
     setStatus("Đang chuyển câu...");
     await safeAdvance(sig);
-  }
-
-  function detectFeedback(options) {
-    const correct = new Set(), wrong = new Set();
-    const OK  = ["correct", "true", "right", "success", "dung", "đúng", "answer-correct", "is-correct"];
-    const BAD = ["incorrect", "wrong", "false", "error", "sai", "answer-wrong", "is-wrong", "is-incorrect"];
-    options.forEach((o, i) => {
-      const cls = (typeof o.className === "string" ? o.className : "").toLowerCase();
-      const parts = cls.split(/\s+/).filter(Boolean);
-      if (parts.some(p => OK.indexOf(p) >= 0))  correct.add(i);
-      if (parts.some(p => BAD.indexOf(p) >= 0)) wrong.add(i);
-    });
-    return { correct: correct, wrong: wrong };
   }
 
   async function handleEssay(ta) {
@@ -820,18 +815,16 @@
     if (state.running) return;
     state.running = true; state.busy = false;
     state.sameSigCount = 0; state.advanceFail = 0; state.idleTicks = 0;
-    state.solvedSigs = new Set();
+    state.solvedSigs = new Set(); clickedOptions = new WeakSet();
     setStatus("Đang chạy...");
-    log("▶ Bắt đầu", "ok");
+    log("▶ Bắt đầu v" + VERSION_STR, "ok");
     tick();
   }
-
   function stop() {
     state.running = false; state.busy = false;
     for (let i = 0; i < state.timers.length; i++) clearTimeout(state.timers[i]);
     state.timers = [];
-    setStatus("Đã dừng");
-    log("■ Dừng", "warn");
+    setStatus("Đã dừng"); log("■ Dừng", "warn");
   }
 
   /* ================= GUI ================= */
@@ -853,7 +846,6 @@
 
   function buildUI() {
     if (document.getElementById(GUI_ID)) return;
-
     const style = document.createElement("style");
     style.textContent = [
       "#" + GUI_ID + " { position:fixed; right:12px; bottom:12px; z-index:2147483600;",
@@ -905,7 +897,7 @@
 
     root.innerHTML =
       '<div class="ais-head" id="ais-head">' +
-        '<span>⚡ ai slover v38.7</span>' +
+        '<span>⚡ ai slover v' + VERSION_STR + '</span>' +
         '<span class="ais-min" id="ais-min">–</span>' +
       '</div>' +
       '<div class="ais-body" id="ais-body">' +
@@ -920,7 +912,7 @@
         '</div>' +
         '<div class="ais-status" id="ais-status">Sẵn sàng</div>' +
         '<div class="ais-log" id="ais-log"></div>' +
-        '<div class="ais-foot">v38.7 · đọc .question-option · không bấm Bỏ qua</div>' +
+        '<div class="ais-foot">v' + VERSION_STR + ' · .question-option · chống toggle-off</div>' +
       '</div>';
     document.body.appendChild(root);
 
@@ -993,7 +985,7 @@
     document.addEventListener("mouseup", () => dragging = false);
     document.addEventListener("touchend", () => dragging = false);
 
-    log("GUI sẵn sàng · default: " + DEFAULT_MODEL, "ok");
+    log("GUI v" + VERSION_STR + " sẵn sàng", "ok");
   }
 
   function boot() {
