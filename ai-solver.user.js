@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         AI Solver v39.1
+// @name         AI Solver v39.2
 // @namespace    https://onluyen.vn/
-// @version      39.1.0
-// @description  Tự động giải trắc nghiệm + tự luận onluyen.vn / app.onluyen.vn (cắt rác khi điền tự luận)
+// @version      39.2.0
+// @description  Tự động giải trắc nghiệm + tự luận onluyen.vn (bấm nút Trả lời sau khi chọn)
 // @match        https://*.onluyen.vn/*
 // @match        https://onluyen.vn/*
 // @grant        GM_xmlhttpRequest
@@ -18,7 +18,7 @@
 (function () {
   "use strict";
 
-  const VERSION_STR      = "39.1.0";
+  const VERSION_STR      = "39.2.0";
   const GUI_ID           = "ai-solver-v38";
   const PROXY_URL        = "https://gen.pollinations.ai/v1/chat/completions";
   const POLL_KEY         = "sk_D8PP0K4jFUDUa0zjrx7uxq1XM1ZoVINK";
@@ -47,9 +47,9 @@
     ".question-item .answer", ".question .answer", ".answer"
   ];
 
-  const BAD_BTN_RE = /(bỏ qua|skip|nộp bài|nộp|xác nhận nộp|hủy|huỷ|cancel|thoát|đóng|close|báo lỗi)/i;
-  const NEXT_RE    = /(câu tiếp|tiếp theo|câu sau|câu kế|kế tiếp|next)/i;
-  const CHROME_SEL = ".answer-sheet,.left-side,.submit-bar,.submit-button,.mobile-bottom-bar";
+  const BAD_BTN_RE    = /(bỏ qua|skip|nộp bài|nộp|xác nhận nộp|hủy|huỷ|cancel|thoát|đóng|close|báo lỗi)/i;
+  const NEXT_RE       = /(câu tiếp|câu sau|tiếp theo|câu kế|kế tiếp|next)/i;
+  const ANSWER_BTN_RE = /(trả lời|làm bài|kiểm tra|xác nhận|gửi|lưu|answer|submit)/i;
 
   const state = {
     running: false, busy: false, timer: null,
@@ -60,7 +60,7 @@
     redoDone: (localStorage.getItem(RESOLVE_KEY) || "1") !== "0",
     autoSubmit: (localStorage.getItem(AUTOSUBMIT_KEY) || "0") === "1",
     verifyPasses: Math.min(3, Math.max(0, parseInt(localStorage.getItem(VERIFY_KEY) || "1", 10) || 0)),
-    lastSig: "", doneSig: "", answered: 0
+    lastSig: "", doneSig: "", answered: 0, stuck: 0
   };
 
   /* ---------- helpers ---------- */
@@ -75,9 +75,22 @@
   function stripFences(s) { return String(s || "").replace(/^\s*```[a-z]*\s*/i, "").replace(/\s*```\s*$/i, "").trim(); }
   function shortModel(m) { return String(m || "").split("/").pop(); }
 
+  function visible(el) {
+    if (!el || !el.isConnected) return false;
+    let r;
+    try { r = el.getBoundingClientRect(); } catch (e) { return false; }
+    if (r.width < 3 || r.height < 3) return false;
+    let st;
+    try { st = window.getComputedStyle(el); } catch (e) { return true; }
+    if (!st) return true;
+    if (st.display === "none" || st.visibility === "hidden") return false;
+    if (parseFloat(st.opacity) === 0) return false;
+    return true;
+  }
+
   /* ---------- GUI ---------- */
   const CSS = `
-#${GUI_ID}{position:fixed;top:10px;right:10px;width:336px;max-height:88vh;display:flex;flex-direction:column;background:#0b1220;color:#e6edf7;border:1px solid #1e293b;border-radius:12px;z-index:2147483000;font:12px/1.45 system-ui;box-shadow:0 12px 34px rgba(0,0,0,.5);overflow:hidden}
+#${GUI_ID}{position:fixed;top:10px;right:10px;width:340px;max-height:88vh;display:flex;flex-direction:column;background:#0b1220;color:#e6edf7;border:1px solid #1e293b;border-radius:12px;z-index:2147483000;font:12px/1.45 system-ui;box-shadow:0 12px 34px rgba(0,0,0,.5);overflow:hidden}
 #${GUI_ID} .ais-head{display:flex;align-items:center;justify-content:space-between;padding:7px 10px;background:#111c33;cursor:move;user-select:none}
 #${GUI_ID} .ais-title{font-weight:700;font-size:12px;color:#7dd3fc}
 #${GUI_ID} .ais-head button{background:#1e293b;color:#cbd5e1;border:0;border-radius:6px;width:22px;height:20px;cursor:pointer;margin-left:4px}
@@ -92,7 +105,7 @@
 #${GUI_ID} #ais-stop{background:#334155;color:#e2e8f0}
 #${GUI_ID} .ais-status{margin:8px 0 5px;padding:6px 8px;background:#111c33;border-radius:7px;color:#93c5fd;font-size:11px}
 #${GUI_ID} .ais-answer{padding:6px 8px;background:#0f2a1d;border:1px solid #14532d;border-radius:7px;color:#86efac;font-size:11px;margin-bottom:6px;display:none;white-space:pre-wrap;word-break:break-word}
-#${GUI_ID} .ais-log{height:156px;overflow:auto;background:#050a14;border:1px solid #16233a;border-radius:7px;padding:5px 7px;font:11px/1.35 ui-monospace,monospace;color:#9fb3c8;white-space:pre-wrap;word-break:break-word}
+#${GUI_ID} .ais-log{height:162px;overflow:auto;background:#050a14;border:1px solid #16233a;border-radius:7px;padding:5px 7px;font:11px/1.35 ui-monospace,monospace;color:#9fb3c8;white-space:pre-wrap;word-break:break-word}
 #${GUI_ID} .ais-foot{padding:5px 10px;background:#111c33;color:#64748b;font-size:10px;text-align:center}
 #${GUI_ID}.ais-min .ais-body,#${GUI_ID}.ais-min .ais-foot{display:none}`;
 
@@ -101,7 +114,7 @@
     const st = document.createElement("style"); st.textContent = CSS; document.head.appendChild(st);
     const root = document.createElement("div"); root.id = GUI_ID;
     root.innerHTML = `
-<div class="ais-head"><span class="ais-title">⚡ ai slover v39.1</span><span><button data-act="min">–</button><button data-act="max">+</button></span></div>
+<div class="ais-head"><span class="ais-title">⚡ ai slover v39.2</span><span><button data-act="min">–</button><button data-act="max">+</button></span></div>
 <div class="ais-body">
 <div class="ais-row"><label>Model</label><select id="ais-model"></select></div>
 <div class="ais-row"><label>Model khác</label><input id="ais-custom" type="text" placeholder="vd: mistral"></div>
@@ -114,7 +127,7 @@
 <div class="ais-answer" id="ais-answer"></div>
 <div class="ais-log" id="ais-log"></div>
 </div>
-<div class="ais-foot">v39.1 · cắt "Đáp án:"/"Câu đúng:" khi điền · chống toggle-off</div>`;
+<div class="ais-foot">v39.2 · bấm nút "Trả lời" sau khi chọn · không bấm Bỏ qua</div>`;
     document.body.appendChild(root);
 
     const sel = root.querySelector("#ais-model");
@@ -156,13 +169,13 @@
   function log(msg) {
     const el = document.getElementById("ais-log");
     const line = "[" + new Date().toLocaleTimeString("vi-VN") + "] " + msg;
-    if (el) { const d = document.createElement("div"); d.textContent = line; el.appendChild(d); while (el.childElementCount > 80) el.removeChild(el.firstChild); el.scrollTop = el.scrollHeight; }
+    if (el) { const d = document.createElement("div"); d.textContent = line; el.appendChild(d); while (el.childElementCount > 90) el.removeChild(el.firstChild); el.scrollTop = el.scrollHeight; }
     console.log("[AI-SOLVER] " + msg);
   }
   function setStatus(s) { const el = document.getElementById("ais-status"); if (el) el.textContent = s; }
   function setAnswer(s) { const el = document.getElementById("ais-answer"); if (!el) return; el.style.display = "block"; el.textContent = s; }
 
-  /* ---------- DOM ---------- */
+  /* ---------- DOM đọc đề ---------- */
   function getQuestionNumber() { const el = qs("#test-step-question .question-header .num") || qs(".question-header .num"); return el ? clean(el.innerText) : ""; }
   function getPassage() { const el = qs("#test-step-question .question-text") || qs(".question-text"); return el ? clean(el.innerText) : ""; }
   function getStem() { const el = qs("#test-step-question .question-name") || qs(".question-name") || qs(".question-stem"); return el ? clean(el.innerText) : ""; }
@@ -188,7 +201,7 @@
     if (el.getAttribute("aria-checked") === "true" || el.getAttribute("aria-selected") === "true") return true;
     const cls = String(el.className || "");
     if (/(^|\s)(selected|checked|active|highlighted|chosen)(\s|$)/.test(cls)) return true;
-    if (/is-(selected|checked|active|correct)/.test(cls)) return true;
+    if (/is-(selected|checked|active)/.test(cls)) return true;
     return false;
   }
   function getEssayTextarea() {
@@ -223,6 +236,115 @@
   }
   function questionSignature(opts) {
     return hash(getQuestionNumber() + "|" + getStem().slice(0, 200) + "|" + (opts || []).map(el => optionText(el).slice(0, 50)).join("§"));
+  }
+
+  /* ---------- nút bấm ---------- */
+  function logSubmitBar() {
+    const parts = [];
+    for (const bar of qsa(".submit-bar")) {
+      for (const b of Array.from(bar.querySelectorAll("button"))) {
+        const t = clean(b.innerText || b.getAttribute("aria-label") || "").slice(0, 16) || "(icon)";
+        parts.push("[" + t + (visible(b) ? "" : "/ẩn") + "]");
+      }
+    }
+    if (parts.length) log("submit-bar: " + parts.join(" "));
+  }
+
+  function findAnswerButton() {
+    // 1) trong .submit-bar
+    for (const bar of qsa(".submit-bar")) {
+      const btns = Array.from(bar.querySelectorAll("button")).filter(b => !insideGui(b) && visible(b));
+      const cands = btns.filter(b => {
+        const t = clean(b.innerText || b.getAttribute("aria-label") || b.title || "");
+        if (/(bỏ qua|skip|nộp bài|xác nhận nộp|hủy|huỷ|cancel|thoát)/i.test(t)) return false;
+        if (/(câu tiếp|câu sau|tiếp theo|next)/i.test(t)) return false;
+        return true;
+      });
+      if (!cands.length) continue;
+      const named = cands.find(b => ANSWER_BTN_RE.test(clean(b.innerText || b.getAttribute("aria-label") || "")));
+      if (named) return named;
+      const nonGray = cands.find(b => !/(^|\s)btn-gray(\s|$)/.test(String(b.className || "")));
+      return nonGray || cands[0];
+    }
+    // 2) fallback ngoài .submit-bar
+    for (const b of qsa("button,a.btn,.btn")) {
+      if (insideGui(b) || !visible(b)) continue;
+      if (b.closest(".answer-sheet") || b.closest(".submit-button") || b.closest(".mobile-bottom-bar")) continue;
+      const t = clean(b.innerText || b.getAttribute("aria-label") || b.title || "");
+      if (!t) continue;
+      if (/(bỏ qua|skip|nộp bài)/i.test(t)) continue;
+      if (/(câu tiếp|câu sau|tiếp theo|next)/i.test(t)) continue;
+      if (ANSWER_BTN_RE.test(t)) return b;
+    }
+    return null;
+  }
+
+  function findNextButton() {
+    for (const b of qsa(".mobile-bottom-bar .nav-btn,.mobile-bottom-bar button")) {
+      if (!visible(b)) continue;
+      if (b.querySelector(".fa-chevron-right")) return b;
+    }
+    const all = qsa("button,a.btn,.btn");
+    for (const b of all) {
+      if (insideGui(b) || !visible(b)) continue;
+      if (b.closest(".answer-sheet") || b.closest(".submit-button")) continue;
+      const t = clean(b.innerText || b.getAttribute("aria-label") || b.title || "");
+      if (!t) continue;
+      if (BAD_BTN_RE.test(t)) continue;
+      if (ANSWER_BTN_RE.test(t) && !NEXT_RE.test(t)) continue;
+      if (NEXT_RE.test(t)) return b;
+    }
+    for (const b of all) {
+      if (insideGui(b) || !visible(b)) continue;
+      if (b.closest(".answer-sheet") || b.closest(".submit-button")) continue;
+      if (b.querySelector(".fa-chevron-right")) return b;
+    }
+    const bar = qsa(".mobile-bottom-bar .nav-btn,.mobile-bottom-bar button").filter(visible);
+    if (bar.length >= 2) {
+      const last = bar[bar.length - 1];
+      const t = clean(last.innerText || last.getAttribute("aria-label") || "");
+      if (!BAD_BTN_RE.test(t)) return last;
+    }
+    return null;
+  }
+
+  function findSubmitButton() {
+    return qs(".submit-button button") || qsa("button").find(x => !insideGui(x) && /nộp bài/i.test(clean(x.innerText))) || null;
+  }
+
+  function dismissDialog() {
+    const sels = [".swal2-confirm", ".modal.show .btn-primary", ".modal-dialog .btn-primary",
+                  ".cdk-overlay-container .btn-primary", ".mat-mdc-dialog-actions button"];
+    for (const s of sels) {
+      for (const b of qsa(s)) {
+        if (!visible(b)) continue;
+        const t = clean(b.innerText || "");
+        if (/nộp/i.test(t)) continue;
+        if (/(đồng ý|ok|xác nhận|yes|tiếp tục|đóng)/i.test(t)) { try { b.click(); } catch (e) {} return true; }
+      }
+    }
+    return false;
+  }
+
+  /* ---------- trạng thái câu ---------- */
+  function hasResultMark() {
+    return qsa(".question-option.correct,.question-option.wrong,.question-option.is-correct,.question-option.is-wrong,.question-option.true,.question-option.false").length > 0;
+  }
+  function submitBarHasNext() {
+    for (const bar of qsa(".submit-bar")) {
+      for (const b of Array.from(bar.querySelectorAll("button"))) {
+        if (insideGui(b) || !visible(b)) continue;
+        const t = clean(b.innerText || b.getAttribute("aria-label") || "");
+        if (/(câu tiếp|câu sau|tiếp theo|next)/i.test(t)) return true;
+      }
+    }
+    return false;
+  }
+  function questionAnsweredState() {
+    if (hasResultMark()) return "answered";
+    if (findAnswerButton()) return "not-answered";
+    if (submitBarHasNext()) return "answered";
+    return "unknown";
   }
 
   /* ---------- API ---------- */
@@ -283,7 +405,6 @@
     if (!tokens) {
       const t = stripFences(text).trim();
       if (/^[A-L](?:\s*[, ]\s*[A-L])*$/i.test(t)) tokens = t.split(/[,\s]+/).filter(Boolean);
-      else if (/^[A-L]$/i.test(t)) tokens = [t];
       else if (/^\d+$/.test(t)) tokens = [t];
       else { const letters = t.match(/\b[A-L]\b/g); if (letters && letters.length <= 4) tokens = letters; }
     }
@@ -302,34 +423,21 @@
     return { idxs, explain, raw: idxs.map(i => String.fromCharCode(65 + i)).join(",") };
   }
 
-  /* ---------- FIX CHÍNH: cắt rác câu tự luận ---------- */
+  /* ---------- cắt rác tự luận ---------- */
   function extractBareAnswer(raw) {
     let t = stripFences(String(raw || "")).trim();
     if (!t) return "";
-
-    // 1) Cắt tại dòng nhãn kiểu "Câu đúng:", "Giải thích:", "Dịch:", "Correct answer:" ...
     const cutRe = /\n\s*(câu\s*đúng|câu\s*hoàn\s*chỉnh|đáp\s*án\s*đúng|giải\s*thích|lời\s*giải|dịch(?:\s*nghĩa)?|nghĩa\s*là|explain|explanation|translation|note|correct\s*(?:answer|sentence))\s*[:：\-–]/i;
     const cut = t.search(cutRe);
     if (cut > 0) t = t.slice(0, cut).trim();
-
-    // 2) Bỏ nhãn mở đầu "Đáp án: ...", "Answer: ..."
     t = t.replace(/^(?:đáp\s*án(?:\s*đúng)?|câu\s*đúng|answer|correct(?:\s*answer)?|trả\s*lời|điền(?:\s*vào)?|kết\s*quả)\s*(?:là)?\s*[:：\-–—]\s*/i, "").trim();
-
-    // 3) Nếu còn nhãn cùng dòng, cắt luôn
     const inline = t.search(/\s+(?:câu\s*đúng|giải\s*thích|dịch\s*(?:nghĩa)?|correct\s*answer)\s*[:：]/i);
     if (inline > 0) t = t.slice(0, inline).trim();
-
-    // 4) Bỏ ngoặc dịch tiếng Việt ở cuối nếu phần chính ngắn (câu điền từ)
     if (t.length <= 200) {
       const m = t.match(/^([\s\S]{1,180}?)\s*\(([^()]{4,})\)\s*\.?\s*$/);
-      if (m && m[1] && /[àáảãạăâđêôơưÀÁẢÃẠĂÂĐÊÔƠƯỳýỷỹỵ]/i.test(m[2])) {
-        t = m[1].trim();
-      }
+      if (m && m[1] && /[àáảãạăâđêôơưÀÁẢÃẠĂÂĐÊÔƠƯỳýỷỹỵ]/i.test(m[2])) t = m[1].trim();
     }
-
-    // 5) Bỏ nháy bao ngoài
     t = t.replace(/^["'`“”‘’]+|["'`“”‘’]+$/g, "").trim();
-
     return t;
   }
 
@@ -341,10 +449,7 @@
     user += "Câu hỏi" + (ctx.number ? " (" + ctx.number + ")" : "") + ":\n" + trunc(ctx.stem, 2200) + "\n\n";
     user += "Các đáp án:\n" + lines + "\n\n";
     user += "Chỉ trả JSON: {\"answer\":\"B\",\"explain\":\"...\"} Nếu nhiều đáp án: {\"answer\":[\"A\",\"C\"],\"explain\":\"...\"}";
-    return [
-      { role: "system", content: "Bạn là giáo viên giỏi, chỉ trả JSON." },
-      { role: "user", content: user }
-    ];
+    return [{ role: "system", content: "Bạn là giáo viên giỏi, chỉ trả JSON." }, { role: "user", content: user }];
   }
   function buildVerifyMessages(ctx, proposal) {
     const lines = ctx.items.map((it, i) => String.fromCharCode(65 + i) + ". " + it.text).join("\n");
@@ -358,18 +463,14 @@
     let user = "";
     if (ctx.passage && ctx.passage !== ctx.stem) user += "Ngữ liệu:\n" + trunc(ctx.passage, 2500) + "\n\n";
     user += "Đề bài:\n" + trunc(ctx.stem, 2500) + "\n\n";
-    user += "QUY TẮC TRẢ LỜI:\n";
-    user += "- Nếu là bài điền từ / chia dạng từ / viết lại câu / điền số: CHỈ trả về đúng cụm từ hoặc câu cần điền.\n";
-    user += "- KHÔNG viết \"Đáp án:\", KHÔNG viết \"Câu đúng:\", KHÔNG giải thích, KHÔNG dịch sang tiếng Việt, KHÔNG đánh số.\n";
-    user += "- Nếu là bài viết đoạn văn / nghị luận: trả về đoạn văn hoàn chỉnh bằng tiếng Việt, không markdown.\n";
-    user += "- Trả lời thẳng, không mở bài, không kết luận thừa.";
-    return [
-      { role: "system", content: "Bạn là giáo viên chấm bài. Trả lời đúng định dạng được yêu cầu, không thêm chữ thừa." },
-      { role: "user", content: user }
-    ];
+    user += "QUY TẮC:\n- Điền từ / chia dạng từ / viết lại câu / điền số: CHỈ trả về đúng cụm từ hoặc câu cần điền.\n";
+    user += "- KHÔNG viết \"Đáp án:\", KHÔNG \"Câu đúng:\", KHÔNG giải thích, KHÔNG dịch, KHÔNG đánh số.\n";
+    user += "- Viết đoạn văn / nghị luận: trả về đoạn văn hoàn chỉnh bằng tiếng Việt, không markdown.\n";
+    user += "- Trả lời thẳng, không mở bài kết luận thừa.";
+    return [{ role: "system", content: "Bạn là giáo viên chấm bài. Trả lời đúng định dạng, không thêm chữ thừa." }, { role: "user", content: user }];
   }
 
-  /* ---------- chọn đáp án MCQ ---------- */
+  /* ---------- chọn đáp án ---------- */
   function forceClick(el) {
     if (!el) return;
     try { el.scrollIntoView({ block: "center" }); } catch (e) {}
@@ -384,7 +485,6 @@
           inp.dispatchEvent(new Event("input", { bubbles: true }));
           inp.dispatchEvent(new Event("change", { bubbles: true }));
         }
-        inp.click();
       } catch (e) {}
     }
     const label = el.querySelector("label");
@@ -404,12 +504,47 @@
       anyClicked = true;
       await sleep(250);
     }
-    if (anyClicked) await sleep(500);
+    if (anyClicked) await sleep(450);
     let ok = idxs.every(i => opts[i] && isSelected(opts[i]));
-    if (!ok && anyClicked) { await sleep(300); ok = idxs.every(i => opts[i] && isSelected(opts[i])); }
+    if (!ok) {
+      for (const i of idxs) {
+        const el = opts[i];
+        if (!el || isSelected(el)) continue;
+        const inp = el.querySelector('input[type="checkbox"],input[type="radio"]');
+        if (inp) { try { inp.click(); } catch (e) {} }
+      }
+      await sleep(400);
+      ok = idxs.every(i => opts[i] && isSelected(opts[i]));
+    }
     const after = answeredCount();
     if (after >= 0 && before >= 0 && after > before) ok = true;
     return { ok, clicked: anyClicked };
+  }
+
+  /* ---------- BẤM "TRẢ LỜI" ---------- */
+  async function clickAnswerAndConfirm() {
+    const ab = findAnswerButton();
+    if (!ab) return { clicked: false, ok: false, reason: "no-button" };
+
+    const before = answeredCount();
+    log("Bấm nút: \"" + trunc(clean(ab.innerText || ab.getAttribute("aria-label") || "(icon)"), 24) + "\"");
+    try { ab.scrollIntoView({ block: "center" }); } catch (e) {}
+    try { ab.click(); } catch (e) {}
+    try { ab.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })); } catch (e) {}
+
+    await sleep(700);
+    dismissDialog();
+    await sleep(700);
+    dismissDialog();
+    await sleep(400);
+
+    const after = answeredCount();
+    const mark = hasResultMark();
+    const gone = !findAnswerButton();
+    const nextNow = submitBarHasNext();
+    const counterUp = before >= 0 && after > before;
+    const ok = counterUp || mark || gone || nextNow;
+    return { clicked: true, ok, before, after, mark, gone, nextNow };
   }
 
   function setNativeValue(el, value) {
@@ -425,30 +560,22 @@
   }
 
   /* ---------- điều hướng ---------- */
-  function findNextButton() {
-    const bar = qsa(".mobile-bottom-bar .nav-btn,.mobile-bottom-bar button");
-    for (const b of bar) { if (b.querySelector(".fa-chevron-right")) return b; }
-    if (bar.length >= 2) return bar[bar.length - 1];
-    for (const b of qsa("button,a.btn,.btn")) {
-      if (insideGui(b) || b.closest(".answer-sheet") || b.closest(".submit-button")) continue;
-      const t = clean(b.innerText || b.getAttribute("aria-label") || b.title || "");
-      if (BAD_BTN_RE.test(t)) continue;
-      if (b.querySelector(".fa-chevron-right")) return b;
-      if (NEXT_RE.test(t)) return b;
-    }
-    return null;
-  }
-  function findSubmitButton() {
-    return qs(".submit-button button") || qsa("button").find(x => !insideGui(x) && /nộp bài/i.test(clean(x.innerText))) || null;
-  }
   async function advance() {
     const btn = findNextButton();
     if (!btn) {
-      if (state.autoSubmit && state.answered > 0) { const sb = findSubmitButton(); if (sb) { log("Tự nộp bài."); sb.click(); state.running = false; return; } }
-      setStatus("Không thấy nút tiếp — có thể hết câu.");
+      state.stuck++;
+      if (state.stuck >= 6) {
+        log("Không tìm thấy nút chuyển câu sau 6 lần — dừng.");
+        setStatus("Kẹt: không thấy nút chuyển câu.");
+        state.running = false;
+        return;
+      }
+      setStatus("Không thấy nút tiếp — chờ... (" + state.stuck + "/6)");
       return;
     }
-    btn.click();
+    state.stuck = 0;
+    try { btn.scrollIntoView({ block: "center" }); } catch (e) {}
+    try { btn.click(); } catch (e) {}
     await sleep(900);
   }
 
@@ -456,8 +583,11 @@
   async function step() {
     if (isFinished()) {
       setStatus("Đã hết câu.");
-      if (state.autoSubmit && state.answered > 0) { const sb = findSubmitButton(); if (sb) { sb.click(); state.running = false; } }
-      else state.running = false;
+      if (state.autoSubmit && state.answered > 0) {
+        const sb = findSubmitButton();
+        if (sb) { log("Tự nộp bài."); sb.click(); }
+      }
+      state.running = false;
       return;
     }
 
@@ -468,16 +598,33 @@
     if (!opts.length && ta) return stepEssay(ta);
 
     const sig = questionSignature(opts);
-    if (sig !== state.lastSig) state.lastSig = sig;
+    if (sig !== state.lastSig) {
+      state.lastSig = sig;
+      state.stuck = 0;
+      logSubmitBar();
+    }
     if (sig === state.doneSig) { await advance(); return; }
+
+    const qstate = questionAnsweredState();
+    if (qstate === "answered") {
+      log("Câu này đã trả lời xong (đáp án khoá) — chuyển câu.");
+      state.doneSig = sig;
+      await advance();
+      return;
+    }
 
     const already = opts.map((el, i) => isSelected(el) ? i : -1).filter(i => i >= 0);
     if (already.length && !state.redoDone) {
       log("Câu đã có đáp án " + already.map(i => String.fromCharCode(65 + i)).join(",") + " — bỏ qua theo cài đặt.");
-      state.doneSig = sig; await advance(); return;
+      state.doneSig = sig;
+      await advance();
+      return;
     }
 
-    const ctx = { number: getQuestionNumber(), passage: getPassage(), stem: getStem(), items: opts.map((el, i) => ({ letter: String.fromCharCode(65 + i), text: optionText(el) })) };
+    const ctx = {
+      number: getQuestionNumber(), passage: getPassage(), stem: getStem(),
+      items: opts.map((el, i) => ({ letter: String.fromCharCode(65 + i), text: optionText(el) }))
+    };
     log("Tìm thấy " + opts.length + " đáp án | " + ctx.number);
     setStatus("Đang hỏi AI…");
 
@@ -494,8 +641,8 @@
     if (!ans) { setStatus("AI chưa trả lời được — sẽ thử lại."); log("RAW cuối: " + trunc(rawLog, 160)); return; }
 
     rememberWorking(usedModel);
-    log("AI (" + shortModel(usedModel) + ") → " + ans.raw + (ans.explain ? " · " + trunc(ans.explain, 80) : ""));
-    setAnswer("Đáp án: " + ans.raw + (ans.explain ? " — " + trunc(ans.explain, 130) : ""));
+    log("AI (" + shortModel(usedModel) + ") → " + ans.raw + (ans.explain ? " · " + trunc(ans.explain, 70) : ""));
+    setAnswer("Đáp án: " + ans.raw + (ans.explain ? " — " + trunc(ans.explain, 120) : ""));
 
     let finalAns = ans;
     for (let p = 0; p < state.verifyPasses; p++) {
@@ -509,33 +656,44 @@
       } catch (e) { log("! Kiểm tra lỗi: " + e.message); }
     }
 
-    const res = await applyAnswer(opts, finalAns.idxs);
-    if (res.ok) {
-      log("Đã chọn " + finalAns.raw + " OK.");
-      setAnswer("Đã chọn: " + finalAns.raw);
-      state.doneSig = sig; state.answered++;
-      await sleep(350); await advance();
+    let sel = await applyAnswer(opts, finalAns.idxs);
+    if (!sel.ok) {
+      log("⚠ Chọn hụt " + finalAns.raw + " — thử lần 2.");
+      await sleep(500);
+      sel = await applyAnswer(opts, finalAns.idxs);
+    }
+    if (!sel.ok) {
+      log("⚠ Vẫn không tick được " + finalAns.raw + " — không chuyển câu, thử lại sau.");
+      setStatus("Không tick được đáp án — thử lại.");
       return;
     }
+    log("Đã tick " + finalAns.raw + ".");
 
-    if (res.clicked) {
-      await sleep(800);
-      const late = finalAns.idxs.every(i => opts[i] && isSelected(opts[i]));
-      if (late) { log("Đã chọn " + finalAns.raw + " (muộn)."); state.doneSig = sig; state.answered++; await advance(); return; }
+    const conf = await clickAnswerAndConfirm();
+    if (!conf.clicked) {
+      log("⚠ KHÔNG thấy nút \"Trả lời\" — đáp án đã tick nhưng chưa gửi được.");
+      setStatus("Không thấy nút Trả lời — kiểm tra panel.");
+    } else if (conf.ok) {
+      log("✔ Đã bấm Trả lời — trang ghi nhận" + (conf.after >= 0 ? " (đã làm: " + conf.after + ")" : "") + ".");
+      setAnswer("Đã trả lời: " + finalAns.raw);
+    } else {
+      log("⚠ Bấm Trả lời nhưng chưa thấy dấu hiệu ghi nhận.");
     }
 
-    log("⚠ Bấm hụt " + finalAns.raw + " — thử lại lần 2.");
-    setStatus("Bấm hụt " + finalAns.raw + " — thử lại...");
-    await sleep(600);
-    const res2 = await applyAnswer(opts, finalAns.idxs);
-    if (res2.ok) { log("Lần 2 OK " + finalAns.raw); state.doneSig = sig; state.answered++; await advance(); }
+    state.doneSig = sig;
+    state.answered++;
+    await sleep(400);
+    await advance();
   }
 
   async function stepEssay(ta) {
     const sig = questionSignature([]);
-    if (sig !== state.lastSig) state.lastSig = sig;
+    if (sig !== state.lastSig) { state.lastSig = sig; state.stuck = 0; logSubmitBar(); }
     if (sig === state.doneSig) { await advance(); return; }
-
+    if (questionAnsweredState() === "answered") {
+      log("Tự luận đã trả lời xong — chuyển câu.");
+      state.doneSig = sig; await advance(); return;
+    }
     if (clean(ta.value).length > 3 && !state.redoDone) {
       log("Tự luận đã có bài — bỏ qua theo cài đặt.");
       state.doneSig = sig; await advance(); return;
@@ -551,33 +709,35 @@
         const raw = await callModel(model, buildEssayMessages(ctx), 1200);
         rawLog = raw;
         const t = extractBareAnswer(raw);
-        if (!t || t.length < 1) { log("⚠ " + shortModel(model) + " tự luận rỗng"); continue; }
+        if (!t) { log("⚠ " + shortModel(model) + " tự luận rỗng"); continue; }
         text = t; usedModel = model; break;
       } catch (e) { log("✖ " + shortModel(model) + ": " + e.message); }
     }
     if (!text) { setStatus("AI không trả lời được tự luận."); log("RAW: " + trunc(rawLog, 160)); return; }
 
     rememberWorking(usedModel);
-    if (text !== rawLog.trim()) log("Cắt rác: RAW " + trunc(rawLog, 80) + " → ĐIỀN " + trunc(text, 80));
-    log("AI (" + shortModel(usedModel) + ") tự luận → " + trunc(text, 130));
+    log("AI (" + shortModel(usedModel) + ") tự luận → " + trunc(text, 120));
     setAnswer(text);
 
     setNativeValue(ta, text);
     await sleep(500);
-    if (clean(ta.value) !== clean(text)) {
-      log("Ô chưa nhận — đặt lại bằng native setter.");
-      setNativeValue(ta, text);
-      await sleep(450);
-    }
-
-    if (clean(ta.value).length > 0) {
-      log("Đã điền tự luận (" + ta.value.length + " ký tự).");
-      state.doneSig = sig; state.answered++;
-      await sleep(350); await advance();
-    } else {
+    if (clean(ta.value) !== clean(text)) { setNativeValue(ta, text); await sleep(400); }
+    if (clean(ta.value).length === 0) {
       log("⚠ Chưa điền được tự luận — thử lại.");
       setStatus("Chưa điền được ô tự luận.");
+      return;
     }
+    log("Đã điền tự luận (" + ta.value.length + " ký tự).");
+
+    const conf = await clickAnswerAndConfirm();
+    if (!conf.clicked) log("⚠ Không thấy nút Trả lời/Lưu cho tự luận.");
+    else if (conf.ok) log("✔ Đã bấm nút tự luận — trang ghi nhận.");
+    else log("⚠ Bấm nút tự luận nhưng chưa thấy ghi nhận.");
+
+    state.doneSig = sig;
+    state.answered++;
+    await sleep(400);
+    await advance();
   }
 
   async function tick() {
@@ -590,7 +750,7 @@
   function start() {
     if (state.running) return;
     state.running = true; state.busy = false;
-    state.doneSig = ""; state.lastSig = ""; state.answered = 0;
+    state.doneSig = ""; state.lastSig = ""; state.answered = 0; state.stuck = 0;
     setStatus("Đang chạy…");
     log("Start · model=" + currentModel() + " · chu kỳ=" + state.interval + "ms · verify=" + state.verifyPasses);
     if (state.timer) clearTimeout(state.timer);
