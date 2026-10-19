@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         AI Solver v39.5
+// @name         AI Solver v39.6
 // @namespace    https://onluyen.vn/
-// @version      39.5.0
-// @description  Auto solve onluyen.vn - robust AI + page diagnostics
+// @version      39.6.0
+// @description  Auto solve onluyen.vn - MCQ + fill + essay + select + dump HTML
 // @match        https://*.onluyen.vn/*
 // @match        https://onluyen.vn/*
 // @grant        GM_xmlhttpRequest
@@ -19,7 +19,7 @@
   "use strict";
 
   /* ================= CONFIG ================= */
-  const VERSION_STR = "39.5.0";
+  const VERSION_STR = "39.6.0";
   const GUI_ID      = "ai-solver-v38";
   const PROXY_URL   = "https://gen.pollinations.ai/v1/chat/completions";
   const POLL_KEY    = "sk_D8PP0K4jFUDUa0zjrx7uxq1XM1ZoVINK";
@@ -70,7 +70,7 @@
     const d = document.createElement("div");
     d.textContent = line;
     logEl.appendChild(d);
-    while (logEl.childNodes.length > 150) logEl.removeChild(logEl.firstChild);
+    while (logEl.childNodes.length > 200) logEl.removeChild(logEl.firstChild);
     logEl.scrollTop = logEl.scrollHeight;
   }
 
@@ -95,7 +95,6 @@
     return !!(el.closest(".popupNoteV2") || el.closest("#test-step-questionnoteTextarea"));
   }
 
-  // CRITICAL: NEVER return `document`. Only return the real question container or null.
   function qRoot() {
     return $("#test-step-question")
         || $(".test-step-question")
@@ -110,17 +109,60 @@
     return tries.map((s) => s + "=" + ($(s) ? "✓" : "✗")).join(" ");
   }
 
+  // ---- OPTIONS: multi-strategy ----
   function getOptions() {
     const root = qRoot();
     if (!root) return [];
-    return $$("#test-step-question div.question-option, .question-container div.question-option", root)
-      .filter((el) => !insideGui(el));
+    const ex = (el) => !insideGui(el) && !el.closest(".answer-sheet") && isVisible(el);
+
+    // Strategy 1: primary
+    let opts = $$("div.question-option", root).filter(ex);
+    if (opts.length >= 2) return opts.slice(0, MAX_OPTIONS);
+
+    // Strategy 2: class variants
+    const classSels = [
+      '[class*="question-option"]','[class*="answer-option"]',
+      '[class*="choice-item"]','[class*="option-item"]',
+      '[class*="answer-item"]','[class*="choice"]','.choice','.option',
+    ];
+    for (let i = 0; i < classSels.length; i++) {
+      opts = $$(classSels[i], root).filter(ex).filter((el) => {
+        const t = (el.textContent || "").trim();
+        return t && t.length < 400;
+      });
+      if (opts.length >= 2 && opts.length <= MAX_OPTIONS) return opts;
+    }
+
+    // Strategy 3: label with radio/checkbox
+    opts = $$("label", root).filter((l) =>
+      l.querySelector('input[type="radio"], input[type="checkbox"]') && ex(l)
+    );
+    if (opts.length >= 2 && opts.length <= MAX_OPTIONS) return opts;
+
+    // Strategy 4: radio/checkbox inputs, use their wrapper
+    const rad = $$('input[type="radio"], input[type="checkbox"]', root).filter((i) =>
+      !insideGui(i) && !i.closest(".answer-sheet") && !isNoteArea(i) && isVisible(i)
+    );
+    if (rad.length >= 2 && rad.length <= MAX_OPTIONS) {
+      return rad.map((i) => i.closest("label") || i.closest('[class*="option"]') || i.parentElement);
+    }
+
+    return [];
+  }
+
+  // ---- SELECTS: new question type ----
+  function getSelects() {
+    const root = qRoot();
+    if (!root) return [];
+    return $$("select", root).filter((el) =>
+      !insideGui(el) && !el.disabled && isVisible(el) && !el.closest(".answer-sheet")
+    );
   }
 
   function getFillInputs() {
     const root = qRoot();
     if (!root) return [];
-    return $$('input[type="text"], input:not([type])', root).filter((el) =>
+    return $$('input[type="text"], input:not([type]), [contenteditable="true"]', root).filter((el) =>
       !insideGui(el) && !isNoteArea(el) && !el.disabled && !el.readOnly &&
       !el.closest(".answer-sheet") && isVisible(el)
     );
@@ -147,7 +189,7 @@
     const host = $("#test-step-question .question-name") || $(".question-name");
     if (!host) return getStemText();
     const clone = host.cloneNode(true);
-    const cloneInputs = $$('input[type="text"], input:not([type])', clone)
+    const cloneInputs = $$('input[type="text"], input:not([type]), [contenteditable="true"]', clone)
       .filter((el) => !isNoteArea(el) && !el.disabled && !el.readOnly);
     cloneInputs.forEach((inp, i) => {
       const sp = document.createElement("span");
@@ -159,11 +201,17 @@
 
   function optionLabel(opt) {
     const l = $(".question-option-label", opt);
-    return l ? (l.textContent || "").trim() : "";
+    if (l) return (l.textContent || "").trim();
+    // Fallback: extract leading letter A/B/C/D from text
+    const t = (opt.textContent || "").trim();
+    const m = t.match(/^([A-D])[\.\)\:]/);
+    return m ? m[1] : "";
   }
   function optionText(opt) {
     const c = $(".question-option-content", opt);
-    return c ? (c.innerText || c.textContent || "").trim() : (opt.innerText || "").trim();
+    if (c) return (c.innerText || c.textContent || "").trim();
+    const t = (opt.textContent || "").trim();
+    return t.replace(/^[A-D][\.\)\:]\s*/, "");
   }
 
   function currentSignature() {
@@ -382,23 +430,25 @@
   }
 
   /* ================= PARSING ================= */
-  function parseAnswerObj(raw, opts) {
+  function parseAnswerLetter(raw) {
     const s = String(raw || "").trim();
-    let obj = null;
+    let key = "";
     try {
       const m = s.match(/\{[\s\S]*\}/);
-      if (m) obj = JSON.parse(m[0]);
+      if (m) {
+        const o = JSON.parse(m[0]);
+        key = String(o.answer || o.correct || o.letter || o.choice || "").trim();
+      }
     } catch (e) {}
-
-    let key = "";
-    if (obj && typeof obj === "object") {
-      key = String(obj.answer || obj.correct || obj.letter || obj.choice || "").trim();
-    }
     if (!key) {
       const mm = s.match(/\b([A-L])\b/);
       if (mm) key = mm[1];
     }
-    key = key.toUpperCase().replace(/[^A-L]/g, "");
+    return key.toUpperCase().replace(/[^A-L]/g, "");
+  }
+
+  function parseAnswerObj(raw, opts) {
+    const key = parseAnswerLetter(raw);
     if (!key) return null;
 
     let idx = -1;
@@ -408,10 +458,19 @@
     if (idx < 0) idx = key.charCodeAt(0) - 65;
     if (idx < 0 || idx >= opts.length) return null;
 
+    let explain = "";
+    try {
+      const m = String(raw || "").match(/\{[\s\S]*\}/);
+      if (m) {
+        const o = JSON.parse(m[0]);
+        explain = (o && (o.explain || o.explanation)) || "";
+      }
+    } catch (e) {}
+
     return {
       index: idx,
       letter: optionLabel(opts[idx]) || String.fromCharCode(65 + idx),
-      explain: (obj && (obj.explain || obj.explanation)) || "",
+      explain: explain,
     };
   }
 
@@ -449,6 +508,14 @@
   /* ================= DOM ACTIONS ================= */
   function typeInto(el, value) {
     if (!el) return false;
+    if (el.isContentEditable) {
+      try { el.focus(); } catch (e) {}
+      el.textContent = value;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      try { el.blur(); } catch (e) {}
+      return (el.textContent || "").trim() === String(value).trim();
+    }
     const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const desc = Object.getOwnPropertyDescriptor(proto, "value");
     try { el.focus(); } catch (e) {}
@@ -552,6 +619,7 @@
   function hasQuestion() {
     if (!qRoot()) return false;
     if (getOptions().length) return true;
+    if (getSelects().length) return true;
     if (getFillInputs().length) return true;
     if (getEssayTextareas().length) return true;
     return false;
@@ -606,6 +674,100 @@
       }
       log("✓ Kiểm tra " + (v + 1) + " giữ: " + pick.letter);
     }
+
+    const btn = await findNewAnswerButton(before);
+    if (!alive(myGen)) return;
+    if (btn) {
+      const t = (btn.textContent || "").trim();
+      btn.click();
+      log('Bấm nút: "' + t + '"');
+      await sleep(1300);
+      beat();
+    } else {
+      log("⚠ Không thấy nút Trả lời trong submit-bar.");
+    }
+
+    if (currentSignature() === sig) { await advance(); }
+    else { log("Trang tự chuyển câu."); await sleep(400); }
+    state.answered++;
+    setStatus("Đã làm " + state.answered + " câu");
+  }
+
+  async function stepSelect(selects, myGen) {
+    if (!alive(myGen)) return;
+    const sig = currentSignature();
+    logSubmitBar();
+    log("Phát hiện " + selects.length + " dropdown <select>.");
+    const before = submitBarTexts();
+    const stem = getStemText();
+
+    let okCount = 0;
+    for (let i = 0; i < selects.length; i++) {
+      if (!alive(myGen)) return;
+      const sel = selects[i];
+      const allOpts = Array.from(sel.options);
+      const realOpts = allOpts.filter((o) => {
+        const t = (o.textContent || "").trim();
+        if (!t) return false;
+        if (/^blank\s+(numbered|no)/i.test(t)) return false;
+        if (/^(chọn|select|--|-|\(chọn\))/i.test(t)) return false;
+        return true;
+      });
+
+      log("  select[" + i + "]: " + realOpts.length + " lựa chọn thật (tổng " + allOpts.length + ").");
+      if (realOpts.length < 2) continue;
+
+      const choices = realOpts.map((o, k) => {
+        const letter = String.fromCharCode(65 + k);
+        return letter + ". " + (o.textContent || "").trim();
+      }).join("\n");
+
+      const messages = [
+        { role: "system", content: "Bạn là giáo viên. Chỉ trả về JSON." },
+        { role: "user", content:
+          "Câu hỏi:\n" + stem + "\n\nCác lựa chọn:\n" + choices +
+          '\n\nChọn đáp án đúng nhất. Trả về đúng định dạng:\n{"answer":"<A/B/C/D>","explain":"<ngắn>"}'
+        },
+      ];
+
+      const res = await askAI(messages);
+      if (!alive(myGen)) return;
+      if (!res.ok) { log("❌ AI lỗi: " + res.error + " — chờ 5s."); await sleep(5000); return; }
+
+      let letter = parseAnswerLetter(res.text);
+      let pickIdx = letter ? letter.charCodeAt(0) - 65 : -1;
+
+      // Text fallback: AI answered with the option text instead of a letter
+      if (pickIdx < 0 || pickIdx >= realOpts.length) {
+        const lc = res.text.toLowerCase();
+        for (let k = 0; k < realOpts.length; k++) {
+          const txt = (realOpts[k].textContent || "").toLowerCase().trim();
+          if (txt && lc.indexOf(txt) >= 0) { pickIdx = k; letter = String.fromCharCode(65 + k); break; }
+        }
+      }
+
+      if (pickIdx < 0 || pickIdx >= realOpts.length) {
+        log("⚠ Không chọn được (letter=" + (letter || "?") + "): " + res.text.slice(0, 80));
+        continue;
+      }
+
+      const chosen = realOpts[pickIdx];
+      const allIdx = allOpts.indexOf(chosen);
+
+      try { sel.focus(); } catch (e) {}
+      sel.selectedIndex = allIdx;
+      sel.dispatchEvent(new Event("input", { bubbles: true }));
+      sel.dispatchEvent(new Event("change", { bubbles: true }));
+      try { sel.blur(); } catch (e) {}
+
+      const finalText = (sel.options[sel.selectedIndex] && (sel.options[sel.selectedIndex].textContent || "")).trim();
+      log("✓ Dropdown " + (i + 1) + ": chọn " + letter + ". " + finalText);
+      showAnswer(letter + ". " + finalText);
+      okCount++;
+      await sleep(150);
+    }
+
+    if (!okCount) { log("⚠ Không chọn được dropdown nào."); await advance(); return; }
 
     const btn = await findNewAnswerButton(before);
     if (!alive(myGen)) return;
@@ -733,17 +895,20 @@
         if (!hasQuestion()) {
           noQ++;
           if (noQ === 1 || noQ % 5 === 0) {
-            log("⏳ Chưa thấy câu hỏi (" + noQ + "/20) · " + qRootDiag());
+            log("⏳ Chưa thấy input/option (" + noQ + "/20) · " + qRootDiag());
+          }
+          if (noQ === 3) {
+            log("💡 Q này lạ? Bấm 🔬 Dump HTML để gửi admin xem cấu trúc.");
           }
           if (noQ >= 20) {
-            log("⚠ 30s không có câu hỏi — thử chuyển câu.");
+            log("⚠ 30s không nhận dạng được — thử chuyển câu.");
             noQ = 0;
             const moved = await advance();
             if (!alive(myGen)) return;
             if (!moved) {
-              log("❌ Không chuyển được câu — dừng. (Hard reload Ctrl+Shift+R rồi thử lại)");
+              log("❌ Không chuyển được câu — dừng. Bấm 🔬 Dump HTML gửi admin.");
               state.running = false;
-              setStatus("Trang không có câu hỏi");
+              setStatus("Trang không nhận dạng");
               break;
             }
             await sleep(1500);
@@ -759,20 +924,22 @@
         else { state.lastSig = sig; state.sameCount = 0; }
 
         if (state.sameCount >= 3) {
-          log("⚠ Kẹt ở câu này 3 lần — thử chuyển câu.");
+          log("⚠ Kẹt câu này 3 lần — thử chuyển.");
           state.sameCount = 0;
           const moved = await advance();
           if (!alive(myGen)) return;
-          if (!moved) { log("⚠ Không chuyển được câu — dừng."); state.running = false; setStatus("Hết câu / không chuyển được"); break; }
+          if (!moved) { log("⚠ Không chuyển được — dừng."); state.running = false; setStatus("Không chuyển được"); break; }
           await sleep(1200);
           continue;
         }
 
         const opts  = getOptions();
-        const fills = opts.length ? [] : getFillInputs();
-        const areas = (opts.length || fills.length) ? [] : getEssayTextareas();
+        const sels  = opts.length ? [] : getSelects();
+        const fills = (opts.length || sels.length) ? [] : getFillInputs();
+        const areas = (opts.length || sels.length || fills.length) ? [] : getEssayTextareas();
 
         if (opts.length)        await stepMcq(opts, myGen);
+        else if (sels.length)   await stepSelect(sels, myGen);
         else if (fills.length)  await stepFill(fills, myGen);
         else if (areas.length)  await stepEssay(areas, myGen);
 
@@ -804,6 +971,16 @@
   });
 
   /* ================= DIAGNOSTICS ================= */
+  function childTags(el, limit) {
+    if (!el) return "(không có)";
+    return Array.from(el.children).slice(0, limit || 12).map((k) => {
+      const tag = k.tagName.toLowerCase();
+      const id = k.id ? ("#" + k.id) : "";
+      const cls = (typeof k.className === "string" ? k.className : "").split(/\s+/).filter(Boolean).slice(0, 4).join(".");
+      return "<" + tag + id + (cls ? ("." + cls) : "") + ">";
+    }).join(" ");
+  }
+
   function checkPage() {
     log("=== KIỂM TRA TRANG ===");
     log("URL: " + location.href);
@@ -812,18 +989,33 @@
       const els = $$(s);
       log("  " + s + ": " + (els.length ? ("×" + els.length) : "✗"));
     });
+
+    log("  .question-name kids: " + childTags($(".question-name")));
+    log("  .question-text kids: " + childTags($(".question-text")));
+    log("  #test-step-question kids: " + childTags($("#test-step-question"), 8));
+
     const opts = getOptions();
-    log("  Options: " + opts.length + (opts.length ? " (" + opts.map(optionLabel).join(",") + ")" : ""));
+    log("  Options (getOptions): " + opts.length + (opts.length ? " (" + opts.map(optionLabel).join(",") + ")" : ""));
+
+    const sels = getSelects();
+    log("  Selects (getSelects): " + sels.length);
+    sels.forEach((s, i) => {
+      const texts = Array.from(s.options).map((o) => (o.textContent || "").trim()).slice(0, 10);
+      log("    select[" + i + "] value=\"" + (s.value || "") + "\" options=[" + texts.join(" | ") + "]");
+    });
+
     log("  Fill inputs: " + getFillInputs().length);
     log("  Essay textareas: " + getEssayTextareas().length);
+
     const bar = submitBarTexts();
     log("  Submit-bar: " + (bar.length ? "[" + bar.join("] [") + "]" : "(trống)"));
     const sheet = $$(".answer-sheet .option");
     const done = sheet.filter((o) => o.classList.contains("done")).length;
     const aIdx = sheet.findIndex((o) => o.classList.contains("active"));
     log("  Answer-sheet: " + sheet.length + " (done: " + done + ", active: #" + (aIdx >= 0 ? (aIdx + 1) : "?") + ")");
+
     const stem = getStemText();
-    log("  Stem: " + (stem ? stem.slice(0, 120).replace(/\s+/g, " ") : "(trống)"));
+    log("  Stem: " + (stem ? stem.slice(0, 160).replace(/\s+/g, " ") : "(trống)"));
     log("======================");
   }
 
@@ -856,6 +1048,55 @@
     log("======================");
   }
 
+  function showHTMLModal(html) {
+    const overlay = document.createElement("div");
+    overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:2147483648;display:flex;flex-direction:column;padding:16px;gap:10px;font-family:system-ui;";
+    const title = document.createElement("div");
+    title.textContent = "HTML #test-step-question (" + html.length + " ký tự) — chọn tất cả, copy, gửi admin";
+    title.style.cssText = "color:#e2e8f0;font-size:13px;font-weight:600;";
+    const ta = document.createElement("textarea");
+    ta.value = html;
+    ta.readOnly = true;
+    ta.style.cssText = "flex:1;width:100%;font-family:monospace;font-size:11px;padding:10px;resize:none;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;";
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;gap:10px;";
+    const copyBtn = document.createElement("button");
+    copyBtn.textContent = "📋 Copy";
+    copyBtn.style.cssText = "flex:1;padding:12px;font-size:14px;font-weight:700;background:#16a34a;color:#fff;border:0;border-radius:8px;cursor:pointer;";
+    copyBtn.onclick = () => {
+      ta.focus(); ta.select();
+      try {
+        const ok = document.execCommand("copy");
+        copyBtn.textContent = ok ? "✅ Đã copy" : "⚠ Chọn tay";
+      } catch (e) { copyBtn.textContent = "⚠ Chọn tay"; }
+    };
+    const closeBtn = document.createElement("button");
+    closeBtn.textContent = "❌ Đóng";
+    closeBtn.style.cssText = "flex:1;padding:12px;font-size:14px;font-weight:700;background:#dc2626;color:#fff;border:0;border-radius:8px;cursor:pointer;";
+    closeBtn.onclick = () => overlay.remove();
+    row.appendChild(copyBtn);
+    row.appendChild(closeBtn);
+    overlay.appendChild(title);
+    overlay.appendChild(ta);
+    overlay.appendChild(row);
+    document.body.appendChild(overlay);
+    setTimeout(() => { try { ta.focus(); ta.select(); } catch (e) {} }, 100);
+  }
+
+  async function dumpHTML() {
+    const root = qRoot();
+    if (!root) { log("❌ Không tìm thấy container câu hỏi."); return; }
+    const html = root.outerHTML.replace(/\s+/g, " ").trim();
+    log("📋 HTML length: " + html.length + " ký tự.");
+    try {
+      await navigator.clipboard.writeText(html);
+      log("✅ Đã copy HTML vào clipboard — dán vào chat.");
+    } catch (e) {
+      log("⚠ Không tự copy được — mở hộp để copy tay.");
+    }
+    showHTMLModal(html);
+  }
+
   /* ================= GUI ================= */
   function buildGui() {
     if (document.getElementById(GUI_ID)) return;
@@ -880,6 +1121,7 @@
       "#" + GUI_ID + " .ais-stop{background:#dc2626;color:#fff}",
       "#" + GUI_ID + " .ais-check-b{background:#2563eb;color:#fff}",
       "#" + GUI_ID + " .ais-test-b{background:#9333ea;color:#fff}",
+      "#" + GUI_ID + " .ais-dump-b{background:#ea580c;color:#fff}",
       "#" + GUI_ID + " .ais-status{color:#94a3b8;font-size:11px}",
       "#" + GUI_ID + " .ais-answer{background:#052e16;border:1px solid #166534;color:#bbf7d0;border-radius:8px;",
       "padding:6px;min-height:20px;word-break:break-word}",
@@ -893,7 +1135,7 @@
     const box = document.createElement("div");
     box.id = GUI_ID;
     box.innerHTML =
-      '<div class="ais-head"><span class="ais-title">⚡ ai slover v39.5</span>' +
+      '<div class="ais-head"><span class="ais-title">⚡ ai slover v39.6</span>' +
       '<button class="ais-min" title="Thu nhỏ">–</button></div>' +
       '<div class="ais-body">' +
         '<label class="ais-row">Model<select class="ais-model"></select></label>' +
@@ -904,11 +1146,12 @@
         '<label class="ais-check"><input class="ais-autosubmit" type="checkbox"> Tự nộp bài khi hết câu (nguy hiểm)</label>' +
         '<div class="ais-actions"><button class="ais-start">▶ Start</button><button class="ais-stop">■ Stop</button></div>' +
         '<div class="ais-actions"><button class="ais-check-b">🔍 Check page</button><button class="ais-test-b">🧪 Test AI</button></div>' +
+        '<div class="ais-actions"><button class="ais-dump-b">🔬 Dump HTML</button></div>' +
         '<div class="ais-status">Chưa chạy</div>' +
         '<div class="ais-answer" id="ais-answer">—</div>' +
         '<div class="ais-log" id="ais-log"></div>' +
       '</div>' +
-      '<div class="ais-foot">v39.5 · chống treo 60s · AI raw-log · qRoot null-safe · nút Check/Test</div>';
+      '<div class="ais-foot">v39.6 · thêm select + dump HTML · chống treo 60s</div>';
 
     document.body.appendChild(box);
 
@@ -978,6 +1221,7 @@
     $(".ais-stop", box).addEventListener("click", stop);
     $(".ais-check-b", box).addEventListener("click", checkPage);
     $(".ais-test-b", box).addEventListener("click", testAI);
+    $(".ais-dump-b", box).addEventListener("click", dumpHTML);
     $(".ais-min", box).addEventListener("click", () => box.classList.toggle("ais-collapsed"));
 
     const head = $(".ais-head", box);
@@ -1026,7 +1270,7 @@
     buildGui();
     log("VERSION " + VERSION_STR + " booted at " + new Date().toISOString());
     log("URL: " + location.href);
-    log("qRoot: " + (qRoot() ? "có container" : "chưa thấy (trang đang tải?)"));
+    log("qRoot: " + (qRoot() ? "có container" : "chưa thấy"));
   }
 
   if (document.readyState === "loading") {
