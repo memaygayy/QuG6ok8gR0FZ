@@ -1,963 +1,901 @@
 // ==UserScript==
-// @name         AI Solver v39.3
+// @name         AI Solver v39.4
 // @namespace    https://onluyen.vn/
-// @version      39.3.0
-// @description  Tự động giải trắc nghiệm + điền từ + tự luận onluyen.vn
+// @version      39.4.0
+// @description  Auto solve onluyen.vn (MCQ + fill + essay) - anti freeze watchdog
 // @match        https://*.onluyen.vn/*
 // @match        https://onluyen.vn/*
 // @grant        GM_xmlhttpRequest
 // @connect      pollinations.ai
 // @connect      gen.pollinations.ai
 // @connect      *
-// @run-at       document-idle
-// @noframes
 // @updateURL    https://raw.githubusercontent.com/memaygayy/QuG6ok8gR0FZ/main/ai-solver.user.js
 // @downloadURL  https://raw.githubusercontent.com/memaygayy/QuG6ok8gR0FZ/main/ai-solver.user.js
+// @run-at       document-idle
+// @noframes
 // ==/UserScript==
 
 (function () {
   "use strict";
 
-  const VERSION_STR      = "39.3.0";
-  const GUI_ID           = "ai-solver-v38";
-  const PROXY_URL        = "https://gen.pollinations.ai/v1/chat/completions";
-  const POLL_KEY         = "sk_D8PP0K4jFUDUa0zjrx7uxq1XM1ZoVINK";
+  /* ================= CONFIG ================= */
+  const VERSION_STR = "39.4.0";
+  const GUI_ID      = "ai-solver-v38";
+  const PROXY_URL   = "https://gen.pollinations.ai/v1/chat/completions";
+  const POLL_KEY    = "sk_D8PP0K4jFUDUa0zjrx7uxq1XM1ZoVINK";
 
   const MODEL_KEY        = "HW_SOLVER_MODEL_V2";
   const MODEL_CUSTOM_KEY = "HW_SOLVER_MODEL_CUSTOM";
   const MODEL_WORKING    = "HW_SOLVER_MODEL_WORKING";
   const INTERVAL_KEY     = "HW_SOLVER_INTERVAL";
-  const RESOLVE_KEY      = "HW_SOLVER_RE_SOLVE_DONE";
-  const AUTOSUBMIT_KEY   = "HW_SOLVER_AUTO_SUBMIT";
   const VERIFY_KEY       = "HW_SOLVER_VERIFY";
+  const AUTOSUBMIT_KEY   = "HW_SOLVER_AUTO_SUBMIT";
 
-  const DEFAULT_MODEL    = "deepseek/deepseek-v4-flash";
-  const FALLBACK_MODELS  = ["deepseek", "gemini", "openai"];
-  const MODEL_CHOICES    = ["deepseek/deepseek-v4-flash", "deepseek", "gemini", "openai", "claude"];
+  const DEFAULT_MODEL  = "deepseek/deepseek-v4-flash";
+  const FALLBACK_MODELS = ["deepseek", "gemini", "openai"];
+  const MODEL_CHOICES  = ["deepseek/deepseek-v4-flash", "deepseek", "gemini", "openai", "claude"];
 
-  const MAX_OPTIONS      = 12;
-  const API_TIMEOUT      = 35000;
-
-  const OPTION_SELECTORS = [
-    "#test-step-question .question-option",
-    ".question-option",
-    ".answer-item",
-    ".answers .item", ".list-answer .item", ".answer-list .item",
-    ".option-item", ".choices .item", ".choice-item",
-    ".question-item .answer", ".question .answer", ".answer"
-  ];
+  const MAX_OPTIONS   = 12;
+  const API_TIMEOUT   = 35000;   // 1 request
+  const WATCHDOG_MS   = 60000;   // không beat quá 60s -> restart loop
+  const ASK_BUDGET_MS = 110000;  // tổng ngân sách 1 lần hỏi AI
 
   const BAD_BTN_RE    = /(bỏ qua|skip|nộp bài|nộp|xác nhận nộp|hủy|huỷ|cancel|thoát|đóng|close|báo lỗi)/i;
   const NEXT_RE       = /(câu tiếp|câu sau|tiếp theo|câu kế|kế tiếp|next)/i;
-  const ANSWER_BTN_RE = /(trả lời|làm bài|kiểm tra|xác nhận|gửi|lưu|answer|submit)/i;
+  const ANSWER_BTN_RE = /(trả lời|làm bài|kiểm tra|xác nhận|gửi|lưu|answer)/i;
 
+  /* ================= STATE ================= */
   const state = {
-    running: false, busy: false, timer: null,
-    interval: parseInt(localStorage.getItem(INTERVAL_KEY) || "1200", 10) || 1200,
-    model: localStorage.getItem(MODEL_KEY) || DEFAULT_MODEL,
-    customModel: localStorage.getItem(MODEL_CUSTOM_KEY) || "",
-    workingModel: localStorage.getItem(MODEL_WORKING) || "",
-    redoDone: (localStorage.getItem(RESOLVE_KEY) || "1") !== "0",
-    autoSubmit: (localStorage.getItem(AUTOSUBMIT_KEY) || "0") === "1",
-    verifyPasses: Math.min(3, Math.max(0, parseInt(localStorage.getItem(VERIFY_KEY) || "1", 10) || 0)),
-    lastSig: "", doneSig: "", answered: 0, stuck: 0
+    running:  false,
+    gen:      0,
+    lastBeat: Date.now(),
+    lastSig:  "",
+    sameCount: 0,
+    answered: 0,
   };
 
-  /* ---------- helpers ---------- */
-  function save(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
-  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-  function qs(s, r) { try { return (r || document).querySelector(s); } catch (e) { return null; } }
-  function qsa(s) { try { return Array.from(document.querySelectorAll(s)); } catch (e) { return []; } }
-  function clean(s) { return String(s || "").replace(/\u00a0/g, " ").replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim(); }
-  function trunc(s, n) { s = String(s || ""); return s.length > n ? s.slice(0, n) + "…" : s; }
-  function insideGui(el) { return !!(el && el.closest && el.closest("#" + GUI_ID)); }
-  function hash(s) { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36) + "-" + s.length; }
-  function stripFences(s) { return String(s || "").replace(/^\s*```[a-z]*\s*/i, "").replace(/\s*```\s*$/i, "").trim(); }
-  function shortModel(m) { return String(m || "").split("/").pop(); }
-  function visible(el) {
-    if (!el || !el.isConnected) return false;
-    let r; try { r = el.getBoundingClientRect(); } catch (e) { return false; }
-    if (r.width < 3 || r.height < 3) return false;
-    let st; try { st = window.getComputedStyle(el); } catch (e) { return true; }
-    if (!st) return true;
-    if (st.display === "none" || st.visibility === "hidden") return false;
-    if (parseFloat(st.opacity) === 0) return false;
-    return true;
-  }
+  const beat = () => { state.lastBeat = Date.now(); };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms | 0)));
 
-  /* ---------- GUI ---------- */
-  const CSS = `
-#${GUI_ID}{position:fixed;top:10px;right:10px;width:342px;max-height:88vh;display:flex;flex-direction:column;background:#0b1220;color:#e6edf7;border:1px solid #1e293b;border-radius:12px;z-index:2147483000;font:12px/1.45 system-ui;box-shadow:0 12px 34px rgba(0,0,0,.5);overflow:hidden}
-#${GUI_ID} .ais-head{display:flex;align-items:center;justify-content:space-between;padding:7px 10px;background:#111c33;cursor:move;user-select:none}
-#${GUI_ID} .ais-title{font-weight:700;font-size:12px;color:#7dd3fc}
-#${GUI_ID} .ais-head button{background:#1e293b;color:#cbd5e1;border:0;border-radius:6px;width:22px;height:20px;cursor:pointer;margin-left:4px}
-#${GUI_ID} .ais-body{padding:8px 10px;overflow:auto}
-#${GUI_ID} .ais-row{display:flex;align-items:center;gap:6px;margin-bottom:6px}
-#${GUI_ID} .ais-row label{flex:0 0 86px;color:#94a3b8;font-size:11px}
-#${GUI_ID} select,#${GUI_ID} input[type=text],#${GUI_ID} input[type=number]{flex:1;min-width:0;background:#111c33;border:1px solid #24344d;color:#e6edf7;border-radius:6px;padding:4px 6px;font-size:11px}
-#${GUI_ID} .ais-chk{display:flex;gap:6px;align-items:center;margin:4px 0;color:#cbd5e1;font-size:11px;cursor:pointer}
-#${GUI_ID} .ais-actions{gap:8px;margin-top:8px}
-#${GUI_ID} .ais-actions button{flex:1;border:0;border-radius:7px;padding:7px 0;font-weight:700;cursor:pointer;font-size:12px}
-#${GUI_ID} #ais-start{background:#16a34a;color:#fff}
-#${GUI_ID} #ais-stop{background:#334155;color:#e2e8f0}
-#${GUI_ID} .ais-status{margin:8px 0 5px;padding:6px 8px;background:#111c33;border-radius:7px;color:#93c5fd;font-size:11px}
-#${GUI_ID} .ais-answer{padding:6px 8px;background:#0f2a1d;border:1px solid #14532d;border-radius:7px;color:#86efac;font-size:11px;margin-bottom:6px;display:none;white-space:pre-wrap;word-break:break-word}
-#${GUI_ID} .ais-log{height:168px;overflow:auto;background:#050a14;border:1px solid #16233a;border-radius:7px;padding:5px 7px;font:11px/1.35 ui-monospace,monospace;color:#9fb3c8;white-space:pre-wrap;word-break:break-word}
-#${GUI_ID} .ais-foot{padding:5px 10px;background:#111c33;color:#64748b;font-size:10px;text-align:center}
-#${GUI_ID}.ais-min .ais-body,#${GUI_ID}.ais-min .ais-foot{display:none}`;
-
-  function buildGui() {
-    if (document.getElementById(GUI_ID)) return;
-    const st = document.createElement("style"); st.textContent = CSS; document.head.appendChild(st);
-    const root = document.createElement("div"); root.id = GUI_ID;
-    root.innerHTML = `
-<div class="ais-head"><span class="ais-title">⚡ ai slover v39.3</span><span><button data-act="min">–</button><button data-act="max">+</button></span></div>
-<div class="ais-body">
-<div class="ais-row"><label>Model</label><select id="ais-model"></select></div>
-<div class="ais-row"><label>Model khác</label><input id="ais-custom" type="text" placeholder="vd: mistral"></div>
-<div class="ais-row"><label>Chu kỳ (ms)</label><input id="ais-interval" type="number" min="300" step="100"></div>
-<div class="ais-row"><label>Kiểm tra lại</label><input id="ais-verify" type="number" min="0" max="3" step="1"></div>
-<label class="ais-chk"><input type="checkbox" id="ais-redo"> Làm lại câu đã đúng</label>
-<label class="ais-chk"><input type="checkbox" id="ais-autosubmit"> Tự nộp bài khi hết câu (nguy hiểm)</label>
-<div class="ais-row ais-actions"><button id="ais-start">▶ Start</button><button id="ais-stop">■ Stop</button></div>
-<div class="ais-status" id="ais-status">Sẵn sàng.</div>
-<div class="ais-answer" id="ais-answer"></div>
-<div class="ais-log" id="ais-log"></div>
-</div>
-<div class="ais-foot">v39.3 · điền từ (input) · chống nhảy cóc · nav phiếu trả lời</div>`;
-    document.body.appendChild(root);
-
-    const sel = root.querySelector("#ais-model");
-    MODEL_CHOICES.forEach(m => { const o = document.createElement("option"); o.value = m; o.textContent = m; sel.appendChild(o); });
-    if (!MODEL_CHOICES.includes(state.model)) { const o = document.createElement("option"); o.value = state.model; o.textContent = state.model; sel.appendChild(o); }
-    sel.value = state.model;
-    sel.addEventListener("change", () => { state.model = sel.value; save(MODEL_KEY, state.model); });
-
-    const custom = root.querySelector("#ais-custom"); custom.value = state.customModel;
-    custom.addEventListener("input", () => { state.customModel = custom.value.trim(); save(MODEL_CUSTOM_KEY, state.customModel); });
-
-    const inter = root.querySelector("#ais-interval"); inter.value = state.interval;
-    inter.addEventListener("change", () => { state.interval = Math.max(300, parseInt(inter.value, 10) || 1200); inter.value = state.interval; save(INTERVAL_KEY, String(state.interval)); });
-
-    const ver = root.querySelector("#ais-verify"); ver.value = state.verifyPasses;
-    ver.addEventListener("change", () => { state.verifyPasses = Math.min(3, Math.max(0, parseInt(ver.value, 10) || 0)); ver.value = state.verifyPasses; save(VERIFY_KEY, String(state.verifyPasses)); });
-
-    const redo = root.querySelector("#ais-redo"); redo.checked = state.redoDone;
-    redo.addEventListener("change", () => { state.redoDone = redo.checked; save(RESOLVE_KEY, redo.checked ? "1" : "0"); });
-
-    const asub = root.querySelector("#ais-autosubmit"); asub.checked = state.autoSubmit;
-    asub.addEventListener("change", () => { state.autoSubmit = asub.checked; save(AUTOSUBMIT_KEY, asub.checked ? "1" : "0"); });
-
-    root.querySelector("#ais-start").addEventListener("click", start);
-    root.querySelector("#ais-stop").addEventListener("click", stop);
-    root.querySelector('[data-act="min"]').addEventListener("click", () => root.classList.add("ais-min"));
-    root.querySelector('[data-act="max"]').addEventListener("click", () => root.classList.remove("ais-min"));
-
-    const head = root.querySelector(".ais-head"); let drag = null;
-    head.addEventListener("mousedown", (e) => {
-      if (e.target.tagName === "BUTTON") return;
-      const r = root.getBoundingClientRect(); drag = { x: e.clientX - r.left, y: e.clientY - r.top };
-      root.style.left = r.left + "px"; root.style.top = r.top + "px"; root.style.right = "auto"; root.style.bottom = "auto"; e.preventDefault();
-    });
-    window.addEventListener("mousemove", (e) => { if (!drag) return; root.style.left = Math.max(0, e.clientX - drag.x) + "px"; root.style.top = Math.max(0, e.clientY - drag.y) + "px"; });
-    window.addEventListener("mouseup", () => { drag = null; });
-  }
+  /* ================= LOG ================= */
+  let logEl = null, statusEl = null, answerEl = null;
 
   function log(msg) {
-    const el = document.getElementById("ais-log");
+    beat();
     const line = "[" + new Date().toLocaleTimeString("vi-VN") + "] " + msg;
-    if (el) { const d = document.createElement("div"); d.textContent = line; el.appendChild(d); while (el.childElementCount > 90) el.removeChild(el.firstChild); el.scrollTop = el.scrollHeight; }
-    console.log("[AI-SOLVER] " + msg);
-  }
-  function setStatus(s) { const el = document.getElementById("ais-status"); if (el) el.textContent = s; }
-  function setAnswer(s) { const el = document.getElementById("ais-answer"); if (!el) return; el.style.display = "block"; el.textContent = s; }
-
-  /* ---------- DOM đọc đề ---------- */
-  function getQuestionNumber() { const el = qs("#test-step-question .question-header .num") || qs(".question-header .num"); return el ? clean(el.innerText) : ""; }
-  function getPassage() { const el = qs("#test-step-question .question-text") || qs(".question-text"); return el ? clean(el.innerText) : ""; }
-  function getStem() { const el = qs("#test-step-question .question-name") || qs(".question-name") || qs(".question-stem"); return el ? clean(el.innerText) : ""; }
-
-  function optionText(el) { const c = el.querySelector(".question-option-content,.option-content,.content,p"); return clean(c ? c.innerText : el.innerText); }
-  function isUsableOption(el) {
-    if (!el || insideGui(el)) return false;
-    if (el.closest(".answer-sheet")) return false;
-    const r = el.getBoundingClientRect();
-    if (r.width < 4 || r.height < 4) return false;
-    return optionText(el).length > 0 || !!el.querySelector("input");
-  }
-  function getOptionEls() {
-    for (const sel of OPTION_SELECTORS) {
-      const list = qsa(sel).filter(isUsableOption);
-      if (list.length >= 2) return list.slice(0, MAX_OPTIONS);
-    }
-    return [];
-  }
-  function isSelected(el) {
-    if (!el) return false;
-    const inp = el.querySelector('input[type="checkbox"],input[type="radio"]');
-    if (inp && inp.checked) return true;
-    if (el.getAttribute("aria-checked") === "true" || el.getAttribute("aria-selected") === "true") return true;
-    const cls = String(el.className || "");
-    if (/(^|\s)(selected|checked|active|highlighted|chosen)(\s|$)/.test(cls)) return true;
-    if (/is-(selected|checked|active)/.test(cls)) return true;
-    return false;
+    try { console.log("[AI-SOLVER]", msg); } catch (e) {}
+    if (!logEl) return;
+    const d = document.createElement("div");
+    d.textContent = line;
+    logEl.appendChild(d);
+    while (logEl.childNodes.length > 120) logEl.removeChild(logEl.firstChild);
+    logEl.scrollTop = logEl.scrollHeight;
   }
 
-  /* ---------- ĐIỀN TỪ: <input config-typeaction="text"> ---------- */
+  function setStatus(s) { if (statusEl) statusEl.textContent = s; }
+  function showAnswer(s) { if (answerEl) answerEl.textContent = s || "—"; }
+
+  /* ================= DOM HELPERS ================= */
+  const $  = (s, r) => (r || document).querySelector(s);
+  const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
+
+  function insideGui(el) { return !!(el && el.closest && el.closest("#" + GUI_ID)); }
+
+  function isVisible(el) {
+    if (!el || !el.getClientRects) return false;
+    if (!el.getClientRects().length) return false;
+    const st = getComputedStyle(el);
+    return st.display !== "none" && st.visibility !== "hidden" && st.opacity !== "0";
+  }
+
   function isNoteArea(el) {
-    return !!(el.closest && (el.closest(".popupNoteV2") || el.closest("#test-step-questionnoteTextarea")));
+    return !!(el && el.closest && (el.closest(".popupNoteV2") || el.closest("#test-step-questionnoteTextarea")));
   }
+
+  function qRoot() { return $("#test-step-question") || document; }
+
+  function getOptions() {
+    return $$("#test-step-question div.question-option").filter((el) => !insideGui(el));
+  }
+
   function getFillInputs() {
-    const list = qsa('#test-step-question input[type="text"], #test-step-question input:not([type])');
-    return list.filter(el =>
+    return $$('input[type="text"], input:not([type])', qRoot()).filter((el) =>
       !insideGui(el) && !isNoteArea(el) && !el.disabled && !el.readOnly &&
-      !el.closest(".answer-sheet") && visible(el)
+      !el.closest(".answer-sheet") && isVisible(el)
     );
   }
+
+  function getEssayTextareas() {
+    return $$("textarea", qRoot()).filter((el) =>
+      !insideGui(el) && !el.disabled && !el.readOnly && !isNoteArea(el) &&
+      el.id !== "test-step-questiontextarea" && isVisible(el)
+    );
+  }
+
+  function getStemText() {
+    const host = $("#test-step-question .question-name") || $("#step .question-name");
+    const ctx  = $("#test-step-question .question-text");
+    const a = host ? (host.innerText || host.textContent || "") : "";
+    const b = ctx  ? (ctx.innerText  || ctx.textContent  || "") : "";
+    return (a + "\n" + b).replace(/\n{3,}/g, "\n\n").trim().slice(0, 3000);
+  }
+
   function stemWithBlanks(inputs) {
-    const root = qs("#test-step-question .question-name") || qs(".question-name") || qs(".question-stem");
-    if (!root) return getStem();
-    try {
-      const clone = root.cloneNode(true);
-      const cloneInputs = Array.from(clone.querySelectorAll('input[type="text"],input:not([type])'));
-      cloneInputs.forEach((inp, i) => {
-        const sp = document.createElement("span");
-        sp.textContent = " [___" + (i + 1) + "___] ";
-        if (inp.parentNode) inp.parentNode.replaceChild(sp, inp);
-      });
-      const t = clean(clone.innerText);
-      if (t) return t;
-    } catch (e) {}
-    return getStem();
+    const host = $("#test-step-question .question-name") || $("#step .question-name");
+    if (!host) return getStemText();
+    const clone = host.cloneNode(true);
+    const cloneInputs = $$('input[type="text"], input:not([type])', clone)
+      .filter((el) => !isNoteArea(el) && !el.disabled && !el.readOnly);
+    cloneInputs.forEach((inp, i) => {
+      const sp = document.createElement("span");
+      sp.textContent = " [___" + (i + 1) + "___] ";
+      if (inp.parentNode) inp.parentNode.replaceChild(sp, inp);
+    });
+    return (clone.innerText || clone.textContent || "").replace(/\s+/g, " ").trim().slice(0, 3000);
   }
 
-  /* ---------- tự luận: chỉ textarea THẬT (không phải ô ghi chú) ---------- */
-  function getEssayTextarea() {
-    const list = qsa("textarea").filter(t =>
-      !insideGui(t) && !t.disabled && !t.readOnly && !isNoteArea(t) &&
-      t.id !== "test-step-questiontextarea" && visible(t)
-    );
-    return list[0] || null;
+  function optionLabel(opt) {
+    const l = $(".question-option-label", opt);
+    return l ? (l.textContent || "").trim() : "";
+  }
+  function optionText(opt) {
+    const c = $(".question-option-content", opt);
+    return c ? (c.innerText || c.textContent || "").trim() : (opt.innerText || "").trim();
   }
 
-  function answeredCount() {
-    const fields = qsa(".left-side .report .field,.report .field");
-    for (const f of fields) {
-      const n = clean((f.querySelector(".field-name") || {}).innerText || "").toLowerCase();
-      if (n.indexOf("đã làm") >= 0) {
-        const v = clean((f.querySelector(".field-value") || {}).innerText || "");
-        const m = v.match(/\d+/); if (m) return parseInt(m[0], 10);
-      }
-    }
-    return -1;
-  }
-  function isFinished() {
-    const opts = qsa(".answer-sheet .option");
-    if (opts.length) { const done = opts.filter(o => o.classList.contains("done")).length; if (done >= opts.length) return true; }
-    const fields = qsa(".left-side .report .field,.report .field");
-    for (const f of fields) {
-      const n = clean((f.querySelector(".field-name") || {}).innerText || "").toLowerCase();
-      if (n.indexOf("chưa làm") >= 0) {
-        const v = clean((f.querySelector(".field-value") || {}).innerText || "");
-        const m = v.match(/\d+/); if (m && parseInt(m[0], 10) === 0) return true;
-      }
-    }
-    return false;
-  }
-  function sheetOptions() { return qsa(".answer-sheet .option"); }
-  function sheetCurrentDone() {
-    const opts = sheetOptions();
-    const act = opts.find(o => o.classList.contains("active"));
-    return act ? act.classList.contains("done") : false;
-  }
-  function clickSheetNext() {
-    const opts = sheetOptions();
-    if (!opts.length) return false;
-    let idx = opts.findIndex(o => o.classList.contains("active"));
-    if (idx < 0) return false;
-    const target = opts[idx + 1];
-    if (!target) return false;
-    try { target.scrollIntoView({ block: "center" }); } catch (e) {}
-    try { target.click(); } catch (e) {}
-    return true;
-  }
-
-  function questionSignature(opts) {
-    return hash(getQuestionNumber() + "|" + getStem().slice(0, 200) + "|" + (opts || []).map(el => optionText(el).slice(0, 50)).join("§"));
-  }
   function currentSignature() {
-    const opts = getOptionEls();
-    const fills = getFillInputs();
-    return hash(getQuestionNumber() + "|" + getStem().slice(0, 200) + "|" +
-      opts.map(el => optionText(el).slice(0, 50)).join("§") + "|fill:" + fills.length);
+    const num = $("#test-step-question .question-header .num");
+    const id  = num ? (num.textContent || "").trim().replace(/\s+/g, " ") : "";
+    const st  = getStemText().slice(0, 80);
+    return id + "|" + st;
   }
 
-  /* ---------- nút bấm ---------- */
-  function submitBarButtons() {
-    const out = [];
-    for (const bar of qsa(".submit-bar")) {
-      for (const b of Array.from(bar.querySelectorAll("button"))) {
-        if (insideGui(b)) continue;
-        out.push(b);
-      }
-    }
-    return out;
-  }
-  function submitBarTexts() { return submitBarButtons().map(b => clean(b.innerText || b.getAttribute("aria-label") || "")); }
-  function logSubmitBar() {
-    const t = submitBarTexts();
-    if (t.length) log("submit-bar: [" + t.map(x => (x || "(icon)").toUpperCase()).join("] [") + "]");
-  }
-  function findNewAnswerButton(beforeTexts) {
-    for (const b of submitBarButtons()) {
-      if (!visible(b)) continue;
-      const t = clean(b.innerText || b.getAttribute("aria-label") || "");
-      if (/(bỏ qua|skip|nộp bài|xác nhận nộp)/i.test(t)) continue;
-      if (beforeTexts.indexOf(t) < 0) return b;
-    }
-    return null;
-  }
-
-  function findAnswerButton() {
-    for (const bar of qsa(".submit-bar")) {
-      const btns = Array.from(bar.querySelectorAll("button")).filter(b => !insideGui(b) && visible(b));
-      const cands = btns.filter(b => {
-        const t = clean(b.innerText || b.getAttribute("aria-label") || b.title || "");
-        if (/(bỏ qua|skip|nộp bài|xác nhận nộp|hủy|huỷ|cancel|thoát)/i.test(t)) return false;
-        if (/(câu tiếp|câu sau|tiếp theo|next)/i.test(t)) return false;
-        return true;
-      });
-      if (!cands.length) continue;
-      const named = cands.find(b => ANSWER_BTN_RE.test(clean(b.innerText || b.getAttribute("aria-label") || "")));
-      if (named) return named;
-      const nonGray = cands.find(b => !/(^|\s)btn-gray(\s|$)/.test(String(b.className || "")));
-      return nonGray || cands[0];
-    }
-    for (const b of qsa("button,a.btn,.btn")) {
-      if (insideGui(b) || !visible(b)) continue;
-      if (b.closest(".answer-sheet") || b.closest(".submit-button") || b.closest(".mobile-bottom-bar")) continue;
-      if (b.closest(".submit-bar")) continue;
-      const t = clean(b.innerText || b.getAttribute("aria-label") || b.title || "");
-      if (!t) continue;
-      if (/(bỏ qua|skip|nộp bài|câu tiếp|câu sau|tiếp theo|next)/i.test(t)) continue;
-      if (ANSWER_BTN_RE.test(t)) return b;
-    }
-    return null;
-  }
-
-  function findNextButton() {
-    for (const b of qsa(".mobile-bottom-bar .nav-btn,.mobile-bottom-bar button")) {
-      if (!visible(b)) continue;
-      if (b.querySelector(".fa-chevron-right")) return b;
-    }
-    for (const b of qsa("button,a.btn,.btn")) {
-      if (insideGui(b) || !visible(b)) continue;
-      if (b.closest(".answer-sheet") || b.closest(".submit-button")) continue;
-      const t = clean(b.innerText || b.getAttribute("aria-label") || b.title || "");
-      if (!t) continue;
-      if (BAD_BTN_RE.test(t)) continue;
-      if (ANSWER_BTN_RE.test(t) && !NEXT_RE.test(t)) continue;
-      if (NEXT_RE.test(t)) return b;
-    }
-    for (const b of qsa("button,a.btn,.btn")) {
-      if (insideGui(b) || !visible(b)) continue;
-      if (b.closest(".answer-sheet") || b.closest(".submit-button")) continue;
-      if (b.querySelector(".fa-chevron-right")) return b;
-    }
-    return null;
-  }
-
-  function findSubmitButton() {
-    return qs(".submit-button button") || qsa("button").find(x => !insideGui(x) && /nộp bài/i.test(clean(x.innerText))) || null;
-  }
-
-  function dismissDialog() {
-    const sels = [".swal2-confirm", ".modal.show .btn-primary", ".modal-dialog .btn-primary",
-                  ".cdk-overlay-container .btn-primary", ".mat-mdc-dialog-actions button"];
-    for (const s of sels) {
-      for (const b of qsa(s)) {
-        if (!visible(b)) continue;
-        const t = clean(b.innerText || "");
-        if (/nộp/i.test(t)) continue;
-        if (/(đồng ý|ok|xác nhận|yes|tiếp tục|đóng)/i.test(t)) { try { b.click(); } catch (e) {} return true; }
-      }
-    }
+  function isSelected(opt) {
+    const cls = (opt.className || "").toLowerCase();
+    if (/(selected|checked|active|highlighted|chosen)/.test(cls)) return true;
+    if (opt.getAttribute("aria-checked") === "true") return true;
+    if (opt.getAttribute("aria-selected") === "true") return true;
+    const inp = opt.querySelector('input[type="checkbox"], input[type="radio"]');
+    if (inp && (inp.checked || inp.getAttribute("aria-checked") === "true")) return true;
     return false;
   }
 
-  function hasResultMark() {
-    return qsa(".question-option.correct,.question-option.wrong,.question-option.is-correct,.question-option.is-wrong").length > 0;
-  }
-  function submitBarHasNext() {
-    for (const b of submitBarButtons()) {
-      if (insideGui(b) || !visible(b)) continue;
-      if (NEXT_RE.test(clean(b.innerText || b.getAttribute("aria-label") || ""))) return true;
-    }
-    return false;
-  }
-  function questionAnsweredState() {
-    if (hasResultMark()) return "answered";
-    if (findAnswerButton()) return "not-answered";
-    if (submitBarHasNext()) return "answered";
-    return "unknown";
+  /* ================= TRANSPORT ================= */
+  function extractContent(text) {
+    try {
+      const j = JSON.parse(text);
+      const c = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+      if (typeof c === "string" && c.trim()) return c.trim();
+      if (typeof j === "string") return j;
+    } catch (e) {}
+    if (typeof text === "string" && text.trim() && text.trim()[0] !== "{") return text.trim();
+    return "";
   }
 
-  /* ---------- API ---------- */
-  function postJSON(url, body) {
-    const headers = { "Content-Type": "application/json", "Accept": "application/json", "Authorization": "Bearer " + POLL_KEY };
-    const data = JSON.stringify(body);
-    return new Promise((resolve, reject) => {
-      let settled = false, lastErr = "";
-      const done = (fn, v) => { if (!settled) { settled = true; fn(v); } };
-      const tryGM = () => {
-        if (typeof GM_xmlhttpRequest !== "function") return done(reject, new Error(lastErr || "fetch failed"));
-        try {
-          GM_xmlhttpRequest({
-            method: "POST", url, headers, data, timeout: API_TIMEOUT,
-            onload: (r) => { if (r.status >= 200 && r.status < 300) done(resolve, r.responseText); else done(reject, new Error("HTTP " + r.status + " " + trunc(r.responseText || "", 120))); },
-            onerror: () => done(reject, new Error("GM network error")),
-            ontimeout: () => done(reject, new Error("GM timeout"))
-          });
-        } catch (e) { done(reject, new Error("GM error: " + e.message)); }
-      };
-      let ctl = null; try { ctl = new AbortController(); } catch (e) {}
-      const to = setTimeout(() => { try { ctl && ctl.abort(); } catch (e) {} }, API_TIMEOUT);
-      fetch(url, { method: "POST", headers, body: data, signal: ctl ? ctl.signal : undefined })
-        .then(async (r) => { clearTimeout(to); const t = await r.text(); if (r.ok) return done(resolve, t); lastErr = "HTTP " + r.status + " " + trunc(t, 80); tryGM(); })
-        .catch((e) => { clearTimeout(to); lastErr = (e && e.name === "AbortError") ? "fetch timeout" : "fetch failed"; tryGM(); });
+  async function fetchJSON(url, opts, ms) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, ms);
+    try {
+      const res = await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
+      const text = await res.text();
+      return { ok: res.ok, status: res.status, text: text };
+    } catch (e) {
+      return { ok: false, error: "fetch:" + (e && e.message ? e.message : e) };
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  function gmRequest(url, body, ms) {
+    return new Promise((resolve) => {
+      if (typeof GM_xmlhttpRequest !== "function") return resolve({ ok: false, error: "no-gm" });
+      let settled = false;
+      const done = (v) => { if (!settled) { settled = true; clearTimeout(guard); resolve(v); } };
+      const guard = setTimeout(() => done({ ok: false, error: "gm-guard-timeout" }), ms + 6000);
+      try {
+        GM_xmlhttpRequest({
+          method: "POST",
+          url: url,
+          headers: { "Content-Type": "application/json", "Authorization": "Bearer " + POLL_KEY },
+          data: body,
+          timeout: ms,
+          onload:    (r) => done({ ok: r.status >= 200 && r.status < 300, status: r.status, text: r.responseText }),
+          onerror:   () => done({ ok: false, error: "gm-net" }),
+          ontimeout: () => done({ ok: false, error: "gm-timeout" }),
+          onabort:   () => done({ ok: false, error: "gm-abort" }),
+        });
+      } catch (e) { done({ ok: false, error: "gm-throw:" + e }); }
     });
   }
-  async function callModel(model, messages, maxTokens) {
-    const text = await postJSON(PROXY_URL, { model, messages, temperature: 0.15, max_tokens: maxTokens || 800 });
-    let json; try { json = JSON.parse(text); } catch (e) { throw new Error("JSON hỏng: " + trunc(text, 80)); }
-    if (json && json.error) throw new Error(json.error.message || "API error");
-    const content = json && json.choices && json.choices[0] && json.choices[0].message ? json.choices[0].message.content : "";
-    if (!content || !String(content).trim()) throw new Error("empty response raw=" + trunc(text, 120));
-    return String(content).trim();
-  }
-  function currentModel() { const c = (state.customModel || "").trim(); return c || state.model || DEFAULT_MODEL; }
-  function modelChain() { const out = []; const push = (m) => { m = String(m || "").trim(); if (m && out.indexOf(m) < 0) out.push(m); }; push(currentModel()); push(state.workingModel); FALLBACK_MODELS.forEach(push); return out; }
-  function rememberWorking(m) { if (!m || m === state.workingModel) return; state.workingModel = m; save(MODEL_WORKING, m); }
 
-  /* ---------- parse MCQ ---------- */
-  function parseAnswerObj(raw, count) {
-    const text = String(raw || "");
-    let tokens = null, explain = "";
-    const a = text.indexOf("{"), b = text.lastIndexOf("}");
-    if (a >= 0 && b > a) {
-      try {
-        const j = JSON.parse(text.slice(a, b + 1));
-        if (j && j.answer != null) {
-          tokens = Array.isArray(j.answer) ? j.answer : [j.answer];
-          explain = String(j.explain || j.explanation || j.reason || j.why || "");
+  function modelChain() {
+    const chosen = (localStorage.getItem(MODEL_CUSTOM_KEY) || "").trim()
+                || (localStorage.getItem(MODEL_KEY) || "").trim()
+                || DEFAULT_MODEL;
+    const working = (localStorage.getItem(MODEL_WORKING) || "").trim();
+    const out = [];
+    [chosen, working].concat(FALLBACK_MODELS).forEach((m) => {
+      if (m && out.indexOf(m) === -1) out.push(m);
+    });
+    return out;
+  }
+
+  function setWorkingModel(m) {
+    try { if (localStorage.getItem(MODEL_WORKING) !== m) localStorage.setItem(MODEL_WORKING, m); } catch (e) {}
+  }
+
+  async function askAI(messages) {
+    const models = modelChain();
+    const deadline = Date.now() + ASK_BUDGET_MS;
+    let lastErr = "unknown";
+
+    for (let mi = 0; mi < models.length; mi++) {
+      if (Date.now() > deadline) { lastErr = "budget-exceeded"; break; }
+      const model = models[mi];
+      const body = JSON.stringify({
+        model: model,
+        messages: messages,
+        temperature: 0.2,
+        max_tokens: 800,
+        private: true,
+        referrer: "onluyen-solver",
+      });
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (Date.now() > deadline) { lastErr = "budget-exceeded"; break; }
+        beat();
+
+        let r = await fetchJSON(PROXY_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": "Bearer " + POLL_KEY },
+          body: body,
+        }, API_TIMEOUT);
+
+        if (!r || !r.ok || !r.text) {
+          beat();
+          const g = await gmRequest(PROXY_URL, body, API_TIMEOUT);
+          if (g && g.ok && g.text) r = g;
+          else if (g && g.error) lastErr = g.error;
         }
-      } catch (e) {}
+
+        if (r && r.ok && r.text) {
+          const txt = extractContent(r.text);
+          if (txt) {
+            setWorkingModel(model);
+            log("AI (" + model + ") OK");
+            return { ok: true, text: txt, model: model };
+          }
+          lastErr = "empty";
+        } else if (r && r.error) {
+          lastErr = r.error;
+        } else if (r && r.status) {
+          lastErr = "HTTP " + r.status;
+        }
+
+        log("↻ Thử lại model " + model + " (lỗi: " + lastErr + ")");
+        await sleep(500);
+      }
     }
-    if (!tokens) {
-      const m = text.match(/(?:đáp án|dap an|answer|chọn|chon)\s*[:\-–]?\s*([A-L0-9][A-L0-9,\s\/\-]*)/i);
-      if (m) tokens = m[1].split(/[,\s\/\-]+/).filter(Boolean);
-    }
-    if (!tokens) {
-      const t = stripFences(text).trim();
-      if (/^[A-L](?:\s*[, ]\s*[A-L])*$/i.test(t)) tokens = t.split(/[,\s]+/).filter(Boolean);
-      else if (/^\d+$/.test(t)) tokens = [t];
-      else { const letters = t.match(/\b[A-L]\b/g); if (letters && letters.length <= 4) tokens = letters; }
-    }
-    if (!tokens) return null;
-    const idxs = [];
-    for (const tk of tokens) {
-      const tt = String(tk).trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
-      if (!tt) continue;
-      let i = -1;
-      if (tt.length === 1 && /[A-Z]/.test(tt)) i = tt.charCodeAt(0) - 65;
-      else if (/^\d+$/.test(tt)) i = parseInt(tt, 10) - 1;
-      if (i >= 0 && i < count && idxs.indexOf(i) < 0) idxs.push(i);
-    }
-    if (!idxs.length) return null;
-    idxs.sort((x, y) => x - y);
-    return { idxs, explain, raw: idxs.map(i => String.fromCharCode(65 + i)).join(",") };
+    return { ok: false, error: lastErr };
   }
 
-  /* ---------- parse điền từ ---------- */
-  function tidyAnswer(s) {
-    return stripFences(String(s || ""))
-      .replace(/^["'`“”‘’\s]+|["'`“”‘’\s]+$/g, "")
-      .replace(/\s+/g, " ")
-      .trim();
+  /* ================= PROMPTS ================= */
+  function buildMcqMessages(opts) {
+    const stem = getStemText();
+    const lines = opts.slice(0, MAX_OPTIONS).map((o, i) => {
+      const lb = optionLabel(o) || String.fromCharCode(65 + i);
+      return lb + ". " + optionText(o);
+    });
+    return [
+      { role: "system", content: "Bạn là giáo viên giải bài tập. Chỉ trả về JSON ngắn gọn, không giải thích ngoài JSON." },
+      { role: "user", content:
+        "Câu hỏi:\n" + stem + "\n\nCác đáp án:\n" + lines.join("\n") +
+        "\n\nHãy chọn đúng 1 đáp án đúng nhất. Trả về đúng định dạng:\n" +
+        '{"answer":"<chữ cái A/B/C/D>","explain":"<giải thích ngắn dưới 20 từ>"}'
+      },
+    ];
   }
+
+  function buildFillMessages(stem, n) {
+    return [
+      { role: "system", content: "Bạn là giáo viên tiếng Anh. Chỉ trả về JSON, không giải thích ngoài JSON." },
+      { role: "user", content:
+        "Điền vào chỗ trống. Mỗi [___k___] là 1 ô cần điền. Có tất cả " + n + " ô.\n\n" + stem +
+        "\n\nTrả về đúng định dạng:\n" +
+        '{"answers":["<ô 1>","<ô 2>"]}\n' +
+        "Chỉ điền đúng dạng từ cần thiết (chia thì/dạng từ), không thêm giải thích."
+      },
+    ];
+  }
+
+  function buildEssayMessages(stem) {
+    return [
+      { role: "system", content: "Bạn là giáo viên. Trả lời NGẮN GỌN, chỉ đưa đáp án, không lan man." },
+      { role: "user", content:
+        "Câu hỏi:\n" + stem +
+        "\n\nTrả lời trực tiếp bằng nội dung cần điền/viết. Không mở đầu bằng 'Đáp án:', không thêm giải thích, không thêm bản dịch."
+      },
+    ];
+  }
+
+  function buildVerifyMessages(stem, chosenText) {
+    return [
+      { role: "system", content: "Bạn là người kiểm tra bài. Chỉ trả về JSON." },
+      { role: "user", content:
+        "Câu hỏi:\n" + stem + "\n\nĐáp án đang chọn: " + chosenText +
+        "\n\nĐáp án này đúng hay sai? Trả về đúng định dạng:\n" +
+        '{"ok":true|false,"answer":"<nếu sai thì đưa đáp án đúng, nếu đúng thì lặp lại đáp án>"}'
+      },
+    ];
+  }
+
+  /* ================= PARSING ================= */
+  function parseAnswerObj(raw, opts) {
+    const s = String(raw || "").trim();
+    let obj = null;
+    try {
+      const m = s.match(/\{[\s\S]*\}/);
+      if (m) obj = JSON.parse(m[0]);
+    } catch (e) {}
+
+    let key = "";
+    if (obj && typeof obj === "object") {
+      key = String(obj.answer || obj.correct || obj.letter || obj.choice || "").trim();
+    }
+    if (!key) {
+      const mm = s.match(/\b([A-L])\b/);
+      if (mm) key = mm[1];
+    }
+    key = key.toUpperCase().replace(/[^A-L]/g, "");
+    if (!key) return null;
+
+    let idx = -1;
+    for (let i = 0; i < opts.length; i++) {
+      if (optionLabel(opts[i]).toUpperCase().indexOf(key[0]) === 0) { idx = i; break; }
+    }
+    if (idx < 0) idx = key.charCodeAt(0) - 65;
+    if (idx < 0 || idx >= opts.length) return null;
+
+    return {
+      index: idx,
+      letter: optionLabel(opts[idx]) || String.fromCharCode(65 + idx),
+      explain: (obj && (obj.explain || obj.explanation)) || "",
+    };
+  }
+
   function parseFillAnswers(raw, n) {
-    const text = String(raw || "");
-    let arr = null, explain = "";
-    const a = text.indexOf("{"), b = text.lastIndexOf("}");
-    if (a >= 0 && b > a) {
-      try {
-        const j = JSON.parse(text.slice(a, b + 1));
-        if (j) {
-          const v = j.answers != null ? j.answers : j.answer;
-          if (v != null) arr = Array.isArray(v) ? v.slice() : [v];
-          explain = String(j.explain || j.explanation || "");
-        }
-      } catch (e) {}
-    }
+    const s = String(raw || "").trim();
+    let arr = null;
+    try {
+      const m = s.match(/\{[\s\S]*\}/);
+      if (m) {
+        const o = JSON.parse(m[0]);
+        if (Array.isArray(o.answers)) arr = o.answers;
+        else if (Array.isArray(o.answer)) arr = o.answer;
+        else if (typeof o.answer === "string") arr = [o.answer];
+      }
+    } catch (e) {}
     if (!arr) {
-      const t = extractBareAnswer(text);
-      if (!t) return null;
-      if (n === 1) arr = [t];
-      else {
-        let parts = t.split(/\r?\n+/).map(s => s.trim()).filter(Boolean);
-        if (parts.length < n) parts = t.split(/\s*[|;]\s*/).map(s => s.trim()).filter(Boolean);
-        if (parts.length < n) parts = t.split(/\s*,\s*/).map(s => s.trim()).filter(Boolean);
-        arr = parts;
-      }
+      const m2 = s.match(/\[[\s\S]*\]/);
+      if (m2) { try { arr = JSON.parse(m2[0]); } catch (e) {} }
     }
-    arr = arr.map(tidyAnswer).filter(Boolean);
-    if (!arr.length) return null;
-    if (n === 1) return { values: [arr[0]], explain };
-    if (arr.length < n) return null;
-    return { values: arr.slice(0, n), explain };
+    if (!arr) arr = s.split(/\s*\|\s*|\n+/);
+    arr = arr.map((x) => String(x == null ? "" : x).trim().replace(/^["'“”]|["'“”]$/g, ""));
+    while (arr.length < n) arr.push("");
+    return arr.slice(0, Math.max(n, 1));
   }
 
-  /* ---------- cắt rác tự luận ---------- */
   function extractBareAnswer(raw) {
-    let t = stripFences(String(raw || "")).trim();
-    if (!t) return "";
-    const cutRe = /\n\s*(câu\s*đúng|câu\s*hoàn\s*chỉnh|đáp\s*án\s*đúng|giải\s*thích|lời\s*giải|dịch(?:\s*nghĩa)?|nghĩa\s*là|explain|explanation|translation|note|correct\s*(?:answer|sentence))\s*[:：\-–]/i;
-    const cut = t.search(cutRe);
-    if (cut > 0) t = t.slice(0, cut).trim();
-    t = t.replace(/^(?:đáp\s*án(?:\s*đúng)?|câu\s*đúng|answer|correct(?:\s*answer)?|trả\s*lời|điền(?:\s*vào)?|kết\s*quả)\s*(?:là)?\s*[:：\-–—]\s*/i, "").trim();
-    const inline = t.search(/\s+(?:câu\s*đúng|giải\s*thích|dịch\s*(?:nghĩa)?|correct\s*answer)\s*[:：]/i);
-    if (inline > 0) t = t.slice(0, inline).trim();
-    if (t.length <= 200) {
-      const m = t.match(/^([\s\S]{1,180}?)\s*\(([^()]{4,})\)\s*\.?\s*$/);
-      if (m && m[1] && /[àáảãạăâđêôơưÀÁẢÃẠĂÂĐÊÔƠƯỳýỷỹỵ]/i.test(m[2])) t = m[1].trim();
-    }
-    t = t.replace(/^["'`“”‘’]+|["'`“”‘’]+$/g, "").trim();
-    return t;
+    let s = String(raw || "").trim();
+    s = s.split(/\n(?:Câu đúng|Giải thích|Dịch|Correct answer|Explanation)\s*[:：]/i)[0];
+    s = s.replace(/^\s*(?:Đáp án|Answer|Trả lời)\s*[:：]\s*/i, "");
+    s = s.replace(/\s*\([^()]*[\u00C0-\u1EF9][^()]*\)\s*$/u, "");
+    s = s.replace(/^["'“”`]+|["'“”`]+$/g, "");
+    return s.trim();
   }
 
-  /* ---------- prompts ---------- */
-  function buildMcqMessages(ctx) {
-    const lines = ctx.items.map((it, i) => String.fromCharCode(65 + i) + ". " + it.text).join("\n");
-    let user = "";
-    if (ctx.passage && ctx.passage !== ctx.stem) user += "Ngữ liệu:\n" + trunc(ctx.passage, 2200) + "\n\n";
-    user += "Câu hỏi" + (ctx.number ? " (" + ctx.number + ")" : "") + ":\n" + trunc(ctx.stem, 2200) + "\n\n";
-    user += "Các đáp án:\n" + lines + "\n\n";
-    user += "Chỉ trả JSON: {\"answer\":\"B\",\"explain\":\"...\"} Nếu nhiều đáp án: {\"answer\":[\"A\",\"C\"],\"explain\":\"...\"}";
-    return [{ role: "system", content: "Bạn là giáo viên giỏi, chỉ trả JSON." }, { role: "user", content: user }];
-  }
-  function buildVerifyMessages(ctx, proposal) {
-    const lines = ctx.items.map((it, i) => String.fromCharCode(65 + i) + ". " + it.text).join("\n");
-    let user = "";
-    if (ctx.passage && ctx.passage !== ctx.stem) user += "Ngữ liệu:\n" + trunc(ctx.passage, 2000) + "\n\n";
-    user += "Câu hỏi:\n" + trunc(ctx.stem, 2000) + "\n\nCác đáp án:\n" + lines + "\n\n";
-    user += "Ý kiến cho rằng đáp án là: " + proposal + ". Kiểm tra lại và trả JSON {\"answer\":\"X\",\"explain\":\"...\"}";
-    return [{ role: "system", content: "Bạn là người kiểm tra, chỉ trả JSON." }, { role: "user", content: user }];
-  }
-  function buildFillMessages(ctx) {
-    let user = "";
-    if (ctx.passage && ctx.passage !== ctx.stem) user += "Ngữ liệu:\n" + trunc(ctx.passage, 1800) + "\n\n";
-    user += "Đề bài:\n" + trunc(ctx.stem, 2200) + "\n\n";
-    user += "Có " + ctx.blanks + " chỗ trống, ký hiệu [___1___], [___2___]... trong đề.\n";
-    user += "Hãy điền từ / cụm từ / dạng đúng của từ cho từng chỗ trống.\n";
-    user += "Chỉ trả JSON: {\"answers\":[\"...\"]}";
-    if (ctx.blanks === 1) user += " (mảng có đúng 1 phần tử)";
-    user += ". CHỈ ghi phần cần điền, KHÔNG ghi lại cả câu, KHÔNG thêm \"Đáp án:\", KHÔNG giải thích, KHÔNG dịch.";
-    return [{ role: "system", content: "Bạn là giáo viên tiếng Anh. Chỉ trả JSON, không thêm chữ nào khác." }, { role: "user", content: user }];
-  }
-  function buildEssayMessages(ctx) {
-    let user = "";
-    if (ctx.passage && ctx.passage !== ctx.stem) user += "Ngữ liệu:\n" + trunc(ctx.passage, 2500) + "\n\n";
-    user += "Đề bài:\n" + trunc(ctx.stem, 2500) + "\n\n";
-    user += "QUY TẮC:\n- Viết đoạn văn / nghị luận: trả về đoạn văn hoàn chỉnh bằng tiếng Việt, không markdown.\n";
-    user += "- KHÔNG viết \"Đáp án:\", KHÔNG giải thích, KHÔNG dịch, KHÔNG đánh số.\n";
-    user += "- Trả lời thẳng, không mở bài kết luận thừa.";
-    return [{ role: "system", content: "Bạn là giáo viên chấm bài. Trả lời đúng định dạng, không thêm chữ thừa." }, { role: "user", content: user }];
-  }
-
-  /* ---------- chọn đáp án MCQ ---------- */
-  function forceClick(el) {
-    if (!el) return;
-    try { el.scrollIntoView({ block: "center" }); } catch (e) {}
-    try { el.click(); } catch (e) {}
-    try { el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })); } catch (e) {}
-    try { el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })); el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true })); } catch (e) {}
-    const inp = el.querySelector('input[type="checkbox"],input[type="radio"]');
-    if (inp) {
-      try {
-        if (!inp.checked) {
-          inp.checked = true;
-          inp.dispatchEvent(new Event("input", { bubbles: true }));
-          inp.dispatchEvent(new Event("change", { bubbles: true }));
-        }
-      } catch (e) {}
-    }
-    const label = el.querySelector("label");
-    if (label) { try { label.click(); } catch (e) {} }
-    const content = el.querySelector(".question-option-content");
-    if (content) { try { content.click(); } catch (e) {} }
-  }
-
-  async function applyAnswer(opts, idxs) {
-    const before = answeredCount();
-    let anyClicked = false;
-    for (const i of idxs) {
-      const el = opts[i];
-      if (!el) continue;
-      if (isSelected(el)) continue;
-      forceClick(el);
-      anyClicked = true;
-      await sleep(250);
-    }
-    if (anyClicked) await sleep(450);
-    let ok = idxs.every(i => opts[i] && isSelected(opts[i]));
-    if (!ok) {
-      for (const i of idxs) {
-        const el = opts[i];
-        if (!el || isSelected(el)) continue;
-        const inp = el.querySelector('input[type="checkbox"],input[type="radio"]');
-        if (inp) { try { inp.click(); } catch (e) {} }
-      }
-      await sleep(400);
-      ok = idxs.every(i => opts[i] && isSelected(opts[i]));
-    }
-    const after = answeredCount();
-    if (after >= 0 && before >= 0 && after > before) ok = true;
-    return { ok, clicked: anyClicked };
-  }
-
-  /* ---------- nhập giá trị vào ô điền từ ---------- */
+  /* ================= DOM ACTIONS ================= */
   function typeInto(el, value) {
-    if (!el) return;
-    try { el.scrollIntoView({ block: "center" }); } catch (e) {}
+    if (!el) return false;
+    const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, "value");
     try { el.focus(); } catch (e) {}
-    try {
-      const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
-      if (desc && desc.set) desc.set.call(el, value); else el.value = value;
-    } catch (e) { el.value = value; }
-    try { el.dispatchEvent(new Event("input", { bubbles: true })); } catch (e) {}
-    try { el.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "a" })); } catch (e) {}
-    try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch (e) {}
-    try { el.dispatchEvent(new Event("blur", { bubbles: true })); } catch (e) {}
-  }
-
-  function setNativeValue(el, value) {
-    try {
-      const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      const desc = Object.getOwnPropertyDescriptor(proto, "value");
-      if (desc && desc.set) desc.set.call(el, value); else el.value = value;
-    } catch (e) { el.value = value; }
+    if (desc && desc.set) desc.set.call(el, value);
+    else el.value = value;
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
     el.dispatchEvent(new Event("blur", { bubbles: true }));
-    try { el.focus(); } catch (e) {}
+    try { el.blur(); } catch (e) {}
+    return String(el.value) === String(value);
   }
 
-  /* ---------- BẤM "TRẢ LỜI" ---------- */
-  async function clickAnswerAndConfirm(sigBefore) {
-    const ab = findAnswerButton();
-    if (!ab) return { clicked: false, ok: false };
-
-    const before = answeredCount();
-    log("Bấm nút: \"" + trunc(clean(ab.innerText || ab.getAttribute("aria-label") || "(icon)"), 24) + "\"");
-    try { ab.scrollIntoView({ block: "center" }); } catch (e) {}
-    try { ab.click(); } catch (e) {}
-    try { ab.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })); } catch (e) {}
-
-    await sleep(700);
-    dismissDialog();
-    await sleep(700);
-    dismissDialog();
-    await sleep(400);
-
-    const after = answeredCount();
-    const advanced = sigBefore && currentSignature() !== sigBefore;
-    const ok = advanced || hasResultMark() || !findAnswerButton() || submitBarHasNext() ||
-               (before >= 0 && after > before);
-    return { clicked: true, ok, advanced, after };
+  async function applyAnswer(idx) {
+    const opts = getOptions();
+    const opt = opts[idx];
+    if (!opt) return false;
+    if (isSelected(opt)) return true;
+    try { opt.scrollIntoView({ block: "center" }); } catch (e) {}
+    await sleep(80);
+    try { opt.click(); } catch (e) {}
+    const inp = opt.querySelector('input[type="checkbox"], input[type="radio"]');
+    if (inp && !inp.checked) { try { inp.click(); } catch (e) {} }
+    await sleep(250);
+    if (isSelected(opt)) return true;
+    await sleep(200);
+    try { opt.click(); } catch (e) {}
+    await sleep(250);
+    return isSelected(opt);
   }
 
-  /* ---------- điều hướng ---------- */
+  function submitBarButtons() {
+    const bar = $(".submit-bar");
+    if (!bar) return [];
+    return $$("button", bar).filter((b) => !insideGui(b));
+  }
+  function submitBarTexts() {
+    return submitBarButtons().map((b) => (b.textContent || "").trim().toUpperCase());
+  }
+  function logSubmitBar() {
+    const t = submitBarTexts();
+    log("submit-bar: " + (t.length ? "[" + t.join("] [") + "]" : "(trống)"));
+  }
+
+  async function findNewAnswerButton(before) {
+    for (let i = 0; i < 10; i++) {
+      const btns = submitBarButtons();
+      for (let j = 0; j < btns.length; j++) {
+        const b = btns[j];
+        const t = (b.textContent || "").trim();
+        if (!t) continue;
+        if (BAD_BTN_RE.test(t)) continue;
+        if (ANSWER_BTN_RE.test(t)) return b;
+        if (before.indexOf(t.toUpperCase()) === -1) return b;
+      }
+      await sleep(250);
+    }
+    return null;
+  }
+
+  function clickSheetNext() {
+    const opts = $$(".answer-sheet .option").filter((o) => !insideGui(o));
+    if (!opts.length) return false;
+    let idx = opts.findIndex((o) => o.classList.contains("active"));
+    if (idx < 0) {
+      idx = opts.findIndex((o) => !o.classList.contains("done"));
+      if (idx < 0) return false;
+      opts[idx].click();
+      return true;
+    }
+    const next = opts[idx + 1];
+    if (next) { next.click(); return true; }
+    return false;
+  }
+
   async function advance() {
-    const btn = findNextButton();
+    beat();
+    if (clickSheetNext()) { await sleep(1000); beat(); return true; }
+
+    const bar = $(".mobile-bottom-bar");
+    if (bar) {
+      const btns = $$("button.nav-btn", bar);
+      for (let i = 0; i < btns.length; i++) {
+        if (btns[i].querySelector(".fa-chevron-right")) {
+          btns[i].click(); await sleep(1000); beat(); return true;
+        }
+      }
+    }
+
+    const cands = $$("button, a.btn").filter((b) =>
+      !insideGui(b) && !b.closest(".submit-bar") && !b.closest(".submit-button") &&
+      !b.closest(".left-side") && !b.closest(".mobile-bottom-bar") && isVisible(b)
+    );
+    for (let i = 0; i < cands.length; i++) {
+      const t = (cands[i].textContent || "").trim();
+      if (!t || BAD_BTN_RE.test(t)) continue;
+      if (NEXT_RE.test(t)) { cands[i].click(); await sleep(1000); beat(); return true; }
+    }
+    return false;
+  }
+
+  function hasQuestion() {
+    if (!$("#test-step-question")) return false;
+    if (getOptions().length) return true;
+    if (getFillInputs().length) return true;
+    if (getEssayTextareas().length) return true;
+    return false;
+  }
+
+  /* ================= STEPS ================= */
+  async function stepMcq(opts) {
+    const sig = currentSignature();
+    logSubmitBar();
+    log("Tìm thấy " + opts.length + " đáp án | " + sig.slice(0, 60));
+
+    const before = submitBarTexts();
+    const stem = getStemText();
+
+    const res = await askAI(buildMcqMessages(opts));
+    if (!res.ok) { log("❌ AI lỗi: " + res.error + " — thử lại sau 3s."); await sleep(3000); return; }
+
+    const pick = parseAnswerObj(res.text, opts);
+    if (!pick) { log("❌ Không đọc được đáp án AI: " + res.text.slice(0, 80)); await sleep(2500); return; }
+
+    log("AI chọn " + pick.letter + " · " + (pick.explain || "").slice(0, 90));
+    showAnswer(pick.letter + ". " + optionText(opts[pick.index]).slice(0, 120));
+
+    let ok = await applyAnswer(pick.index);
+    log(ok ? ("Đã tick " + pick.letter + ".") : ("⚠ Không tick được " + pick.letter + " — thử lại."));
+    if (!ok) ok = await applyAnswer(pick.index);
+
+    const verifyN = getVerifyCount();
+    for (let v = 0; v < verifyN; v++) {
+      beat();
+      const chosen = optionLabel(opts[pick.index]) + ". " + optionText(opts[pick.index]);
+      const vr = await askAI(buildVerifyMessages(stem, chosen));
+      if (!vr.ok) { log("… kiểm tra " + (v + 1) + " bỏ qua (" + vr.error + ")"); continue; }
+      let needFix = false;
+      try {
+        const m = vr.text.match(/\{[\s\S]*\}/);
+        if (m) { const o = JSON.parse(m[0]); if (o && o.ok === false) needFix = true; }
+      } catch (e) {}
+      if (needFix) {
+        const np = parseAnswerObj(vr.text, opts);
+        if (np && np.index !== pick.index) {
+          log("↻ Kiểm tra thấy sai — đổi sang " + np.letter);
+          pick.index = np.index; pick.letter = np.letter;
+          await applyAnswer(pick.index);
+          continue;
+        }
+      }
+      log("✓ Kiểm tra " + (v + 1) + " giữ: " + pick.letter);
+    }
+
+    const btn = await findNewAnswerButton(before);
     if (btn) {
-      state.stuck = 0;
-      try { btn.scrollIntoView({ block: "center" }); } catch (e) {}
-      try { btn.click(); } catch (e) {}
-      await sleep(1000);
-      return;
-    }
-    if (clickSheetNext()) {
-      state.stuck = 0;
-      log("Không có nút Tiếp — chuyển câu bằng phiếu trả lời.");
-      await sleep(1100);
-      return;
-    }
-    state.stuck++;
-    if (state.stuck >= 6) {
-      log("Không tìm thấy nút chuyển câu sau 6 lần — dừng.");
-      setStatus("Kẹt: không thấy nút chuyển câu.");
-      state.running = false;
-      return;
-    }
-    setStatus("Không thấy nút tiếp — chờ... (" + state.stuck + "/6)");
-  }
-
-  /* ---------- vòng lặp ---------- */
-  async function step() {
-    if (isFinished()) {
-      setStatus("Đã hết câu.");
-      if (state.autoSubmit && state.answered > 0) {
-        const sb = findSubmitButton();
-        if (sb) { log("Tự nộp bài."); sb.click(); }
-      }
-      state.running = false;
-      return;
+      const t = (btn.textContent || "").trim();
+      btn.click();
+      log('Bấm nút: "' + t + '"');
+      await sleep(1300);
+      beat();
+    } else {
+      log("⚠ Không thấy nút Trả lời trong submit-bar.");
     }
 
-    const fills = getFillInputs();
-    if (fills.length) return stepFill(fills);
-
-    const ta = getEssayTextarea();
-    const opts = getOptionEls();
-
-    if (!opts.length && !ta) {
-      if (sheetCurrentDone()) {
-        log("Câu hiện tại đã làm xong (phiếu trả lời đánh dấu) — chuyển câu.");
-        await advance();
-        return;
-      }
-      setStatus("Chưa thấy câu hỏi… chờ render (" + getQuestionNumber() + ")");
-      return;
-    }
-    if (!opts.length && ta) return stepEssay(ta);
-
-    const sig = questionSignature(opts);
-    if (sig !== state.lastSig) { state.lastSig = sig; state.stuck = 0; logSubmitBar(); }
-    if (sig === state.doneSig) { await advance(); return; }
-
-    if (questionAnsweredState() === "answered") {
-      log("Câu này đã trả lời xong (đáp án khoá) — chuyển câu.");
-      state.doneSig = sig;
-      await advance();
-      return;
-    }
-
-    const already = opts.map((el, i) => isSelected(el) ? i : -1).filter(i => i >= 0);
-    if (already.length && !state.redoDone) {
-      log("Câu đã có đáp án " + already.map(i => String.fromCharCode(65 + i)).join(",") + " — bỏ qua theo cài đặt.");
-      state.doneSig = sig;
-      await advance();
-      return;
-    }
-
-    const ctx = {
-      number: getQuestionNumber(), passage: getPassage(), stem: getStem(),
-      items: opts.map((el, i) => ({ letter: String.fromCharCode(65 + i), text: optionText(el) }))
-    };
-    log("Tìm thấy " + opts.length + " đáp án | " + ctx.number);
-    setStatus("Đang hỏi AI…");
-
-    let ans = null, usedModel = "", rawLog = "";
-    for (const model of modelChain()) {
-      try {
-        const raw = await callModel(model, buildMcqMessages(ctx));
-        rawLog = raw;
-        const parsed = parseAnswerObj(raw, ctx.items.length);
-        if (!parsed) { log("⚠ " + shortModel(model) + " trả về không parse được: " + trunc(raw, 100)); continue; }
-        ans = parsed; usedModel = model; break;
-      } catch (e) { log("✖ " + shortModel(model) + ": " + e.message); }
-    }
-    if (!ans) { setStatus("AI chưa trả lời được — sẽ thử lại."); log("RAW cuối: " + trunc(rawLog, 160)); return; }
-
-    rememberWorking(usedModel);
-    log("AI (" + shortModel(usedModel) + ") → " + ans.raw + (ans.explain ? " · " + trunc(ans.explain, 70) : ""));
-    setAnswer("Đáp án: " + ans.raw + (ans.explain ? " — " + trunc(ans.explain, 120) : ""));
-
-    let finalAns = ans;
-    for (let p = 0; p < state.verifyPasses; p++) {
-      try {
-        const raw = await callModel(usedModel, buildVerifyMessages(ctx, finalAns.raw));
-        const parsed = parseAnswerObj(raw, ctx.items.length);
-        if (!parsed) continue;
-        if (parsed.raw !== finalAns.raw) log("↻ Kiểm tra đổi: " + finalAns.raw + " → " + parsed.raw);
-        else log("✓ Kiểm tra giữ: " + parsed.raw);
-        finalAns = parsed;
-      } catch (e) { log("! Kiểm tra lỗi: " + e.message); }
-    }
-
-    let sel = await applyAnswer(opts, finalAns.idxs);
-    if (!sel.ok) { log("⚠ Chọn hụt " + finalAns.raw + " — thử lần 2."); await sleep(500); sel = await applyAnswer(opts, finalAns.idxs); }
-    if (!sel.ok) { log("⚠ Vẫn không tick được " + finalAns.raw + " — không chuyển câu."); setStatus("Không tick được đáp án — thử lại."); return; }
-    log("Đã tick " + finalAns.raw + ".");
-
-    const conf = await clickAnswerAndConfirm(sig);
-    if (!conf.clicked) { log("⚠ KHÔNG thấy nút \"Trả lời\"."); setStatus("Không thấy nút Trả lời."); }
-    else if (conf.ok) log("✔ Đã bấm Trả lời — trang ghi nhận" + (conf.after >= 0 ? " (đã làm: " + conf.after + ")" : "") + ".");
-    else log("⚠ Bấm Trả lời nhưng chưa thấy dấu hiệu ghi nhận.");
-
-    state.doneSig = sig;
+    if (currentSignature() === sig) { await advance(); }
+    else { log("Trang tự chuyển câu."); await sleep(400); }
     state.answered++;
-    await sleep(500);
-
-    // chống nhảy cóc: nếu trang đã tự chuyển câu thì không bấm Tiếp nữa
-    if (currentSignature() === sig) await advance();
-    else log("Trang tự chuyển câu.");
+    setStatus("Đã làm " + state.answered + " câu");
   }
 
-  /* ---------- ĐIỀN TỪ ---------- */
   async function stepFill(inputs) {
     const sig = currentSignature();
-    if (sig !== state.lastSig) { state.lastSig = sig; state.stuck = 0; logSubmitBar(); }
-    if (sig === state.doneSig) { await advance(); return; }
-
-    if (inputs.every(i => clean(i.value).length > 0) && !state.redoDone) {
-      log("Điền từ đã có đáp án — bỏ qua theo cài đặt.");
-      state.doneSig = sig;
-      await advance();
-      return;
-    }
-
+    logSubmitBar();
+    log("Phát hiện " + inputs.length + " ô điền từ.");
+    const before = submitBarTexts();
     const stem = stemWithBlanks(inputs);
-    setStatus("Đang hỏi AI (điền từ)…");
-    const ctx = { number: getQuestionNumber(), passage: getPassage(), stem, blanks: inputs.length };
 
-    let parsed = null, usedModel = "", rawLog = "";
-    for (const model of modelChain()) {
-      try {
-        const raw = await callModel(model, buildFillMessages(ctx), 500);
-        rawLog = raw;
-        const p = parseFillAnswers(raw, inputs.length);
-        if (!p) { log("⚠ " + shortModel(model) + " điền từ không parse được: " + trunc(raw, 100)); continue; }
-        parsed = p; usedModel = model; break;
-      } catch (e) { log("✖ " + shortModel(model) + ": " + e.message); }
-    }
-    if (!parsed) { setStatus("AI chưa trả lời được (điền từ)."); log("RAW cuối: " + trunc(rawLog, 160)); return; }
+    const res = await askAI(buildFillMessages(stem, inputs.length));
+    if (!res.ok) { log("❌ AI lỗi: " + res.error + " — thử lại sau 3s."); await sleep(3000); return; }
 
-    rememberWorking(usedModel);
-    const shown = parsed.values.join(" | ");
-    log("AI (" + shortModel(usedModel) + ") điền từ → " + trunc(shown, 120) + " | RAW=" + trunc(rawLog, 80));
-    setAnswer("Điền: " + shown);
+    const answers = parseFillAnswers(res.text, inputs.length);
+    log("AI điền từ → " + answers.join(" | "));
 
-    const before = submitBarTexts();
-    for (let i = 0; i < inputs.length; i++) { typeInto(inputs[i], parsed.values[i]); await sleep(200); }
-    await sleep(700);
-
+    let filled = 0;
     for (let i = 0; i < inputs.length; i++) {
-      if (clean(inputs[i].value) !== clean(parsed.values[i])) { typeInto(inputs[i], parsed.values[i]); await sleep(200); }
+      const v = (answers[i] || "").trim();
+      if (!v) continue;
+      if (typeInto(inputs[i], v)) filled++;
+      await sleep(120);
     }
-    await sleep(400);
+    log("Đã điền " + filled + "/" + inputs.length + " ô.");
+    showAnswer(answers.filter(Boolean).join(" | "));
 
-    const filledOk = inputs.every((el, i) => clean(el.value) === clean(parsed.values[i]));
-    if (!filledOk) { log("⚠ Có ô chưa nhận giá trị — thử lại sau."); setStatus("Ô điền từ chưa nhận giá trị."); return; }
-    log("Đã điền " + inputs.length + " ô: " + inputs.map(i => trunc(clean(i.value), 30)).join(" | "));
+    if (!filled) { log("⚠ Không điền được ô nào — bỏ qua câu này."); await advance(); return; }
 
-    const btn = findNewAnswerButton(before) || findAnswerButton();
+    const btn = await findNewAnswerButton(before);
     if (btn) {
-      log("Bấm nút: \"" + trunc(clean(btn.innerText || btn.getAttribute("aria-label") || "(icon)"), 24) + "\"");
-      try { btn.click(); } catch (e) {}
-      await sleep(800);
-      dismissDialog();
-      await sleep(600);
-      const after = answeredCount();
-      if (after >= 0) log("Trang ghi nhận (đã làm: " + after + ").");
+      const t = (btn.textContent || "").trim();
+      btn.click();
+      log('Bấm nút: "' + t + '"');
+      await sleep(1300);
+      beat();
     } else {
-      log("Không có nút Trả lời riêng (điền từ) — chuyển câu.");
+      log("⚠ Không thấy nút Trả lời trong submit-bar.");
     }
 
-    state.doneSig = sig;
+    if (currentSignature() === sig) { await advance(); }
+    else { log("Trang tự chuyển câu."); await sleep(400); }
     state.answered++;
-    await sleep(500);
-    if (currentSignature() === sig) await advance();
-    else log("Trang tự chuyển câu.");
+    setStatus("Đã làm " + state.answered + " câu");
   }
 
-  /* ---------- TỰ LUẬN ---------- */
-  async function stepEssay(ta) {
+  async function stepEssay(areas) {
     const sig = currentSignature();
-    if (sig !== state.lastSig) { state.lastSig = sig; state.stuck = 0; logSubmitBar(); }
-    if (sig === state.doneSig) { await advance(); return; }
-    if (questionAnsweredState() === "answered") {
-      log("Tự luận đã trả lời xong — chuyển câu.");
-      state.doneSig = sig; await advance(); return;
-    }
-    if (clean(ta.value).length > 3 && !state.redoDone) {
-      log("Tự luận đã có bài — bỏ qua theo cài đặt.");
-      state.doneSig = sig; await advance(); return;
-    }
-
-    setStatus("Đang hỏi AI (tự luận)…");
-    const ctx = { passage: getPassage(), stem: getStem() || getPassage() };
-    if (!ctx.stem) { setStatus("Chưa thấy đề tự luận…"); return; }
-
-    let text = "", usedModel = "", rawLog = "";
-    for (const model of modelChain()) {
-      try {
-        const raw = await callModel(model, buildEssayMessages(ctx), 1200);
-        rawLog = raw;
-        const t = extractBareAnswer(raw);
-        if (!t) { log("⚠ " + shortModel(model) + " tự luận rỗng"); continue; }
-        text = t; usedModel = model; break;
-      } catch (e) { log("✖ " + shortModel(model) + ": " + e.message); }
-    }
-    if (!text) { setStatus("AI không trả lời được tự luận."); log("RAW: " + trunc(rawLog, 160)); return; }
-
-    rememberWorking(usedModel);
-    log("AI (" + shortModel(usedModel) + ") tự luận → " + trunc(text, 120));
-    setAnswer(text);
-
+    logSubmitBar();
+    log("Phát hiện " + areas.length + " ô tự luận.");
     const before = submitBarTexts();
-    setNativeValue(ta, text);
-    await sleep(500);
-    if (clean(ta.value) !== clean(text)) { setNativeValue(ta, text); await sleep(400); }
-    if (clean(ta.value).length === 0) { log("⚠ Chưa điền được tự luận."); setStatus("Chưa điền được ô tự luận."); return; }
-    log("Đã điền tự luận (" + ta.value.length + " ký tự).");
+    const stem = getStemText();
 
-    const btn = findNewAnswerButton(before) || findAnswerButton();
+    const res = await askAI(buildEssayMessages(stem));
+    if (!res.ok) { log("❌ AI lỗi: " + res.error + " — thử lại sau 3s."); await sleep(3000); return; }
+
+    const bare = extractBareAnswer(res.text);
+    if (!bare) { log("❌ AI trả về rỗng."); await sleep(2500); return; }
+    log("AI tự luận → " + bare.slice(0, 120));
+    showAnswer(bare.slice(0, 200));
+
+    const area = areas[0];
+    const ok = typeInto(area, bare);
+    log(ok ? ("Đã điền tự luận (" + bare.length + " ký tự).") : "⚠ Không điền được tự luận.");
+
+    const btn = await findNewAnswerButton(before);
     if (btn) {
-      log("Bấm nút: \"" + trunc(clean(btn.innerText || btn.getAttribute("aria-label") || "(icon)"), 24) + "\"");
-      try { btn.click(); } catch (e) {}
-      await sleep(800); dismissDialog(); await sleep(500);
+      const t = (btn.textContent || "").trim();
+      btn.click();
+      log('Bấm nút: "' + t + '"');
+      await sleep(1300);
+      beat();
     } else {
-      log("Không có nút Trả lời riêng (tự luận) — chuyển câu.");
+      log("⚠ Không thấy nút Trả lời/Lưu cho tự luận.");
     }
 
-    state.doneSig = sig;
+    if (currentSignature() === sig) { await advance(); }
+    else { log("Trang tự chuyển câu."); await sleep(400); }
     state.answered++;
-    await sleep(500);
-    if (currentSignature() === sig) await advance();
-    else log("Trang tự chuyển câu.");
+    setStatus("Đã làm " + state.answered + " câu");
   }
 
-  async function tick() {
-    if (!state.running || state.busy) return;
-    state.busy = true;
-    try { await step(); } catch (e) { log("Lỗi vòng lặp: " + e.message); }
-    finally { state.busy = false; if (state.running) state.timer = setTimeout(tick, state.interval); }
+  /* ================= LOOP + WATCHDOG ================= */
+  function getInterval() {
+    const v = parseInt(localStorage.getItem(INTERVAL_KEY) || "2500", 10);
+    return isNaN(v) ? 2500 : Math.max(1200, v);
+  }
+  function getVerifyCount() {
+    const v = parseInt(localStorage.getItem(VERIFY_KEY) || "1", 10);
+    return isNaN(v) ? 1 : Math.max(0, Math.min(3, v));
+  }
+
+  async function loop() {
+    const myGen = ++state.gen;
+    beat();
+    log("▶ Vòng lặp bắt đầu (gen " + myGen + ")");
+
+    while (state.running && myGen === state.gen) {
+      try {
+        beat();
+
+        if (!hasQuestion()) {
+          log("Chưa thấy câu hỏi (trang đang tải)... chờ.");
+          await sleep(1500);
+          continue;
+        }
+
+        const sig = currentSignature();
+        if (sig === state.lastSig) state.sameCount++;
+        else { state.lastSig = sig; state.sameCount = 0; }
+
+        if (state.sameCount >= 3) {
+          log("⚠ Kẹt ở câu này 3 lần — thử chuyển câu.");
+          state.sameCount = 0;
+          const moved = await advance();
+          if (!moved) { log("⚠ Không chuyển được câu — dừng."); state.running = false; setStatus("Hết câu / không chuyển được"); break; }
+          await sleep(1200);
+          continue;
+        }
+
+        const opts = getOptions();
+        if (opts.length)            await stepMcq(opts);
+        else {
+          const fills = getFillInputs();
+          if (fills.length)         await stepFill(fills);
+          else {
+            const areas = getEssayTextareas();
+            if (areas.length)       await stepEssay(areas);
+            else { log("Không xác định được dạng câu — chờ."); await sleep(1500); continue; }
+          }
+        }
+
+        await sleep(getInterval());
+      } catch (err) {
+        log("❌ Lỗi vòng lặp: " + (err && err.message ? err.message : String(err)));
+        await sleep(2000);
+      }
+    }
+
+    log("■ Vòng lặp dừng (gen " + myGen + ")");
+    if (state.running && myGen === state.gen) {
+      // thoát bất thường -> tự chạy lại
+      setTimeout(() => { if (state.running) loop(); }, 500);
+    }
+  }
+
+  setInterval(() => {
+    if (!state.running) return;
+    const idle = Date.now() - state.lastBeat;
+    if (idle > WATCHDOG_MS) {
+      log("⚠ Không hoạt động " + Math.round(idle / 1000) + "s — tự khởi động lại vòng lặp.");
+      state.gen++;
+      state.lastBeat = Date.now();
+      setTimeout(() => { if (state.running) loop(); }, 300);
+    }
+  }, 5000);
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) log("⚠ Tab bị ẩn — trình duyệt có thể tạm dừng script (giữ tab hiện).");
+    else { beat(); log("Tab hiện lại — tiếp tục."); }
+  });
+
+  /* ================= GUI ================= */
+  function buildGui() {
+    if (document.getElementById(GUI_ID)) return;
+
+    const style = document.createElement("style");
+    style.textContent = [
+      "#" + GUI_ID + "{position:fixed;top:12px;right:12px;width:330px;max-height:86vh;z-index:2147483647;",
+      "background:#0f172a;color:#e2e8f0;font:12px/1.45 system-ui,Segoe UI,Arial;border:1px solid #334155;",
+      "border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.45);display:flex;flex-direction:column;overflow:hidden}",
+      "#" + GUI_ID + " .ais-head{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;",
+      "background:#1e293b;cursor:move;user-select:none}",
+      "#" + GUI_ID + " .ais-title{font-weight:700;color:#38bdf8}",
+      "#" + GUI_ID + " .ais-head button{background:#334155;color:#e2e8f0;border:0;border-radius:6px;width:24px;height:22px;cursor:pointer}",
+      "#" + GUI_ID + " .ais-body{padding:8px 10px;overflow:auto;display:flex;flex-direction:column;gap:6px}",
+      "#" + GUI_ID + " .ais-row{display:flex;align-items:center;justify-content:space-between;gap:8px}",
+      "#" + GUI_ID + " .ais-row select,#" + GUI_ID + " .ais-row input{flex:1;min-width:0;background:#1e293b;color:#e2e8f0;",
+      "border:1px solid #334155;border-radius:6px;padding:4px 6px;font-size:12px}",
+      "#" + GUI_ID + " .ais-check{display:flex;align-items:center;gap:6px;font-size:11px;color:#cbd5e1}",
+      "#" + GUI_ID + " .ais-actions{display:flex;gap:6px;margin-top:2px}",
+      "#" + GUI_ID + " .ais-actions button{flex:1;padding:6px;border:0;border-radius:8px;cursor:pointer;font-weight:600}",
+      "#" + GUI_ID + " .ais-start{background:#16a34a;color:#fff}",
+      "#" + GUI_ID + " .ais-stop{background:#dc2626;color:#fff}",
+      "#" + GUI_ID + " .ais-status{color:#94a3b8;font-size:11px}",
+      "#" + GUI_ID + " .ais-answer{background:#052e16;border:1px solid #166534;color:#bbf7d0;border-radius:8px;",
+      "padding:6px;min-height:20px;word-break:break-word}",
+      "#" + GUI_ID + " .ais-log{background:#020617;border:1px solid #1e293b;border-radius:8px;padding:6px;",
+      "height:150px;overflow:auto;font:11px/1.4 ui-monospace,Consolas,monospace;color:#94a3b8;white-space:pre-wrap}",
+      "#" + GUI_ID + " .ais-foot{padding:6px 10px;background:#1e293b;color:#64748b;font-size:10px;text-align:center}",
+      "#" + GUI_ID + ".ais-collapsed .ais-body,#" + GUI_ID + ".ais-collapsed .ais-foot{display:none}",
+    ].join("");
+    document.head.appendChild(style);
+
+    const box = document.createElement("div");
+    box.id = GUI_ID;
+    box.innerHTML =
+      '<div class="ais-head"><span class="ais-title">⚡ ai slover v39.4</span>' +
+      '<button class="ais-min" title="Thu nhỏ">–</button></div>' +
+      '<div class="ais-body">' +
+        '<label class="ais-row">Model<select class="ais-model"></select></label>' +
+        '<label class="ais-row">Model khác<input class="ais-custom" type="text" placeholder="vd: openai"></label>' +
+        '<label class="ais-row">Chu kỳ (ms)<input class="ais-interval" type="number" min="1200" step="500"></label>' +
+        '<label class="ais-row">Kiểm tra lại<input class="ais-verify" type="number" min="0" max="3" step="1"></label>' +
+        '<label class="ais-check"><input class="ais-redo" type="checkbox"> Làm lại câu đã đúng</label>' +
+        '<label class="ais-check"><input class="ais-autosubmit" type="checkbox"> Tự nộp bài khi hết câu (nguy hiểm)</label>' +
+        '<div class="ais-actions"><button class="ais-start">▶ Start</button><button class="ais-stop">■ Stop</button></div>' +
+        '<div class="ais-status">Chưa chạy</div>' +
+        '<div class="ais-answer" id="ais-answer">—</div>' +
+        '<div class="ais-log" id="ais-log"></div>' +
+      '</div>' +
+      '<div class="ais-foot">v39.4 · điền từ (input) · chống nhảy cóc · chống treo (watchdog 60s)</div>';
+
+    document.body.appendChild(box);
+
+    logEl    = $("#ais-log", box);
+    statusEl = $(".ais-status", box);
+    answerEl = $("#ais-answer", box);
+
+    const sel = $(".ais-model", box);
+    MODEL_CHOICES.forEach((m) => {
+      const o = document.createElement("option");
+      o.value = m; o.textContent = m;
+      sel.appendChild(o);
+    });
+
+    const savedModel = localStorage.getItem(MODEL_KEY) || DEFAULT_MODEL;
+    if (MODEL_CHOICES.indexOf(savedModel) === -1) {
+      const o = document.createElement("option");
+      o.value = savedModel; o.textContent = savedModel;
+      sel.appendChild(o);
+    }
+    sel.value = savedModel;
+    sel.addEventListener("change", () => {
+      localStorage.setItem(MODEL_KEY, sel.value);
+      localStorage.removeItem(MODEL_CUSTOM_KEY);
+      $(".ais-custom", box).value = "";
+      log("Đổi model: " + sel.value);
+    });
+
+    const custom = $(".ais-custom", box);
+    custom.value = localStorage.getItem(MODEL_CUSTOM_KEY) || "";
+    custom.addEventListener("change", () => {
+      const v = custom.value.trim();
+      if (v) { localStorage.setItem(MODEL_CUSTOM_KEY, v); log("Model khác: " + v); }
+      else { localStorage.removeItem(MODEL_CUSTOM_KEY); }
+    });
+
+    const intervalInp = $(".ais-interval", box);
+    intervalInp.value = localStorage.getItem(INTERVAL_KEY) || "2500";
+    intervalInp.addEventListener("change", () => {
+      const v = Math.max(1200, parseInt(intervalInp.value, 10) || 2500);
+      intervalInp.value = v;
+      localStorage.setItem(INTERVAL_KEY, String(v));
+    });
+
+    const verifyInp = $(".ais-verify", box);
+    verifyInp.value = localStorage.getItem(VERIFY_KEY) || "1";
+    verifyInp.addEventListener("change", () => {
+      const v = Math.max(0, Math.min(3, parseInt(verifyInp.value, 10) || 0));
+      verifyInp.value = v;
+      localStorage.setItem(VERIFY_KEY, String(v));
+    });
+
+    const redo = $(".ais-redo", box);
+    redo.checked = localStorage.getItem("HW_SOLVER_REDO_DONE") !== "0";
+    redo.addEventListener("change", () => {
+      localStorage.setItem("HW_SOLVER_REDO_DONE", redo.checked ? "1" : "0");
+    });
+
+    const auto = $(".ais-autosubmit", box);
+    auto.checked = localStorage.getItem(AUTOSUBMIT_KEY) === "1";
+    auto.addEventListener("change", () => {
+      localStorage.setItem(AUTOSUBMIT_KEY, auto.checked ? "1" : "0");
+      if (auto.checked) log("⚠ Đã bật tự nộp bài — cẩn thận!");
+    });
+
+    $(".ais-start", box).addEventListener("click", start);
+    $(".ais-stop", box).addEventListener("click", stop);
+    $(".ais-min", box).addEventListener("click", () => box.classList.toggle("ais-collapsed"));
+
+    // drag
+    const head = $(".ais-head", box);
+    let dragging = false, ox = 0, oy = 0;
+    head.addEventListener("mousedown", (e) => {
+      if (e.target.tagName === "BUTTON") return;
+      dragging = true;
+      const r = box.getBoundingClientRect();
+      ox = e.clientX - r.left; oy = e.clientY - r.top;
+      e.preventDefault();
+    });
+    document.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      box.style.left = Math.max(0, e.clientX - ox) + "px";
+      box.style.top  = Math.max(0, e.clientY - oy) + "px";
+      box.style.right = "auto";
+    });
+    document.addEventListener("mouseup", () => { dragging = false; });
+
+    log("GUI sẵn sàng. Bấm ▶ Start.");
   }
 
   function start() {
-    if (state.running) return;
-    state.running = true; state.busy = false;
-    state.doneSig = ""; state.lastSig = ""; state.answered = 0; state.stuck = 0;
-    setStatus("Đang chạy…");
-    log("Start · model=" + currentModel() + " · chu kỳ=" + state.interval + "ms · verify=" + state.verifyPasses);
-    if (state.timer) clearTimeout(state.timer);
-    tick();
-  }
-  function stop() {
-    state.running = false;
-    if (state.timer) { clearTimeout(state.timer); state.timer = null; }
-    setStatus("Đã dừng."); log("Stop.");
-  }
-
-  /* ---------- boot ---------- */
-  console.log("[AI-SOLVER] VERSION " + VERSION_STR + " booted at " + new Date().toISOString());
-  function boot() {
-    if (!document.body) return setTimeout(boot, 400);
+    if (state.running) { log("Đang chạy rồi."); return; }
     buildGui();
-    log("v" + VERSION_STR + " sẵn sàng · model=" + currentModel());
+    state.running = true;
+    state.lastSig = "";
+    state.sameCount = 0;
+    state.answered = 0;
+    state.lastBeat = Date.now();
+    setStatus("Đang chạy...");
+    log("Model chain: " + modelChain().join(" → "));
+    loop();
   }
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
-  else boot();
 
+  function stop() {
+    if (!state.running) { log("Chưa chạy."); return; }
+    state.running = false;
+    state.gen++;
+    setStatus("Đã dừng");
+    log("■ Đã dừng theo yêu cầu.");
+  }
+
+  /* ================= BOOT ================= */
+  function boot() {
+    buildGui();
+    log("VERSION " + VERSION_STR + " booted at " + new Date().toISOString());
+    log("URL: " + location.href);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", () => setTimeout(boot, 800));
+  } else {
+    setTimeout(boot, 800);
+  }
 })();
