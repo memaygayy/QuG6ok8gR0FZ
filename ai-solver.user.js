@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         AI Solver v38.6
+// @name         AI Solver v38.7
 // @namespace    https://github.com/memaygayy/QuG6ok8gR0FZ
-// @version      38.6.0
-// @description  Auto solve onluyen.vn — không tự nộp bài, chờ câu load, kiểm tra đáp án
+// @version      38.7.0
+// @description  Auto solve onluyen.vn — .question-option, không bấm "Bỏ qua"/"Nộp Bài"
 // @author       memaygayy
 // @match        https://*.onluyen.vn/*
 // @grant        GM_xmlhttpRequest
@@ -21,7 +21,6 @@
   window.__AI_SOLVER_V38__ = true;
 
   /* ================= CONFIG ================= */
-  const VERSION   = "38.6.0";
   const GUI_ID    = "ai-solver-v38";
   const PROXY_URL = "https://gen.pollinations.ai/v1/chat/completions";
   const POLL_KEY  = "sk_D8PP0K4jFUDUa0zjrx7uxq1XM1ZoVINK";
@@ -42,7 +41,7 @@
   const MAX_ANSWER_RETRY = 2;
   const API_TIMEOUT      = 35000;
   const NEXT_WAIT        = 8000;
-  const QUESTION_WAIT_MS = 15000;
+  const QUESTION_WAIT_MS = 20000;
 
   /* ================= STATE ================= */
   const state = {
@@ -72,21 +71,30 @@
     if (r.width < 6 || r.height < 6) return false;
     const st = getComputedStyle(el);
     if (st.display === "none" || st.visibility === "hidden") return false;
-    if (parseFloat(st.opacity) < 0.05) return false;
     return true;
   }
 
   function insideGui(el) { const g = document.getElementById(GUI_ID); return !!(g && el && g.contains(el)); }
+
+  function insideChrome(el) {
+    if (!el || !el.closest) return false;
+    if (el.closest("#" + GUI_ID))       return true;
+    if (el.closest(".answer-sheet"))    return true;
+    if (el.closest(".mobile-bottom-bar")) return true;
+    if (el.closest(".left-side"))       return true;
+    if (el.closest(".submit-bar"))      return true;
+    return false;
+  }
+
   function hashStr(s) { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36); }
-  function cleanText(el) { return (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim(); }
+  function cleanText(el) { return (el && (el.innerText || el.textContent) || "").replace(/\s+/g, " ").trim(); }
 
   function isDisabled(el) {
     if (!el) return true;
     if (el.disabled) return true;
     if (el.getAttribute && el.getAttribute("aria-disabled") === "true") return true;
     const cls = typeof el.className === "string" ? el.className : "";
-    if (/\b(disabled|is-disabled|btn-disabled|btn--disabled)\b/i.test(cls)) return true;
-    try { if (getComputedStyle(el).pointerEvents === "none") return true; } catch (e) {}
+    if (/\b(disabled|is-disabled|btn-disabled)\b/i.test(cls)) return true;
     return false;
   }
 
@@ -121,17 +129,13 @@
   /* ================= TRANSPORT ================= */
   async function fetchJSON(opts) {
     const ctrl = new AbortController();
-    const ms = opts.timeout || API_TIMEOUT;
-    const t = setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, ms);
+    const t = setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, opts.timeout || API_TIMEOUT);
     try {
       const res = await fetch(opts.url, {
         method: opts.method || "GET",
         headers: opts.headers || {},
         body: opts.data,
-        signal: ctrl.signal,
-        mode: "cors",
-        credentials: "omit",
-        cache: "no-store"
+        signal: ctrl.signal, mode: "cors", credentials: "omit", cache: "no-store"
       });
       return { status: res.status, responseText: await res.text() };
     } finally { clearTimeout(t); }
@@ -142,10 +146,8 @@
       if (typeof GM_xmlhttpRequest !== "function") { reject(new Error("GM_xmlhttpRequest undefined")); return; }
       try {
         GM_xmlhttpRequest({
-          method: opts.method || "GET",
-          url: opts.url,
-          headers: opts.headers || {},
-          data: opts.data,
+          method: opts.method || "GET", url: opts.url,
+          headers: opts.headers || {}, data: opts.data,
           timeout: opts.timeout || API_TIMEOUT,
           onload: r => resolve({ status: r.status, responseText: r.responseText }),
           onerror: () => reject(new Error("GM network error")),
@@ -164,7 +166,6 @@
       return r;
     } catch (e) {
       if (TRANSPORT === "fetch") throw e;
-      log("fetch thất bại (" + e.message + ") → GM_xmlhttpRequest", "warn");
       const r = await gmJSON(opts);
       TRANSPORT = "gm";
       log("Transport = GM_xmlhttpRequest (OK)", "warn");
@@ -176,15 +177,11 @@
   async function askAIOnce(messages, model) {
     const body = { model: model, messages: messages, temperature: 0.2, max_tokens: 900, private: true };
     const res = await request({
-      method: "POST",
-      url: PROXY_URL,
+      method: "POST", url: PROXY_URL,
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + POLL_KEY },
-      data: JSON.stringify(body),
-      timeout: API_TIMEOUT
+      data: JSON.stringify(body), timeout: API_TIMEOUT
     });
-    if (res.status !== 200) {
-      throw new Error("HTTP " + res.status + " " + (res.responseText || "").slice(0, 140).replace(/\s+/g, " "));
-    }
+    if (res.status !== 200) throw new Error("HTTP " + res.status + " " + (res.responseText || "").slice(0, 140).replace(/\s+/g, " "));
     let json;
     try { json = JSON.parse(res.responseText); }
     catch (e) { throw new Error("bad json: " + (res.responseText || "").slice(0, 120)); }
@@ -213,17 +210,13 @@
       const m = queue[i];
       try {
         const text = await askAI(messages, m);
-        if (m !== working) {
-          localStorage.setItem(MODEL_WORKING, m);
-          log("Model dùng được: " + m + " (áp dụng các câu sau)", "ok");
-        }
+        if (m !== working) { localStorage.setItem(MODEL_WORKING, m); log("Model dùng được: " + m, "ok"); }
         return text;
       } catch (e) {
         lastErr = e;
         log("Model " + m + " lỗi: " + e.message, "warn");
         if (working && m === working) localStorage.removeItem(MODEL_WORKING);
-        const modelIssue = /not found|404|unsupported|invalid model|empty|bad json|400|401|403|429/i.test(e.message);
-        if (!modelIssue) break;   // network timeout → dừng, không thử model khác
+        if (!/not found|404|unsupported|invalid model|empty|bad json|400|401|403|429/i.test(e.message)) break;
       }
     }
     throw lastErr || new Error("API failed");
@@ -236,16 +229,13 @@
     const sys = [
       "Bạn là trợ lý giải bài tập trắc nghiệm.",
       "Đọc kỹ câu hỏi và chọn đáp án đúng nhất.",
-      "Nếu câu hỏi có thể có nhiều đáp án đúng, liệt kê tất cả.",
+      "Nếu câu có nhiều đáp án đúng, liệt kê tất cả.",
       "Trả lời ĐÚNG định dạng, không thêm gì khác:",
       "ĐÁP ÁN: <chữ cái, nhiều đáp án cách nhau dấu phẩy>",
       "GIẢI THÍCH: <1-2 câu ngắn gọn>"
     ].join("\n");
-
     let user = "Câu hỏi:\n" + stem + "\n\nCác lựa chọn:\n" + list + "\n\nChọn đáp án đúng.";
-    if (prevWrong && prevWrong.length) {
-      user += "\n\nLƯU Ý: đáp án " + prevWrong.join(", ") + " đã bị SAI. Bắt buộc chọn đáp án KHÁC.";
-    }
+    if (prevWrong && prevWrong.length) user += "\n\nLƯU Ý: đáp án " + prevWrong.join(", ") + " đã bị SAI. Bắt buộc chọn đáp án KHÁC.";
     return [{ role: "system", content: sys }, { role: "user", content: user }];
   }
 
@@ -261,14 +251,12 @@
       const i = ch.charCodeAt(0) - 65;
       if (i >= 0 && i < count) out.add(i);
     });
-
     if (!out.size) {
       (s.toUpperCase().match(/(?:^|[\s:.,(])([A-F])(?=[\s.,)\n]|$)/g) || []).forEach(tok => {
         const ch = tok.trim().replace(/[^A-F]/g, "");
         if (ch.length === 1) { const i = ch.charCodeAt(0) - 65; if (i >= 0 && i < count) out.add(i); }
       });
     }
-
     if (!out.size && m) {
       (seg.match(/\b(\d{1,2})\b/g) || []).forEach(n => {
         const i = parseInt(n, 10) - 1;
@@ -278,146 +266,47 @@
     return Array.from(out).sort((a, b) => a - b);
   }
 
-  /* ================= DOM DETECTION ================= */
+  /* ================= DOM: ĐÁP ÁN ================= */
   const OPTION_SELECTORS = [
-    ".answer-item", ".answers .item", ".list-answer .item", ".answer-list .item",
+    "#test-step-question .question-option",
+    ".question-option",
+    ".answer-item",
+    ".answers .item", ".list-answer .item", ".answer-list .item",
     ".option-item", ".choices .item", ".choice-item",
-    ".question-item .answer", ".question .answer", ".answer", ".option"
+    ".question-item .answer", ".question .answer", ".answer"
   ];
-  const SUBMIT_RE = /(nộp bài|nộp|kiểm tra|submit|check|hoàn thành|xác nhận)/i;
-  const NEXT_RE   = /(câu tiếp|tiếp theo|câu sau|next|tiếp|sau)/i;
-  const FINAL_RE  = /(nộp bài|hoàn thành|xác nhận nộp|kết thúc)/i;
+
+  const BAD_BTN_RE = /(bỏ qua|skip|nộp bài|nộp|xác nhận nộp|hủy|huỷ|cancel|thoát|đóng|close|báo lỗi)/i;
 
   function isButtonLike(n) {
     const t = cleanText(n).toLowerCase();
-    return /^(nộp bài|nộp|kiểm tra|tiếp|câu tiếp|câu tiếp theo|next|submit|start|stop|gửi)$/.test(t);
+    return /^(nộp bài|nộp|kiểm tra|bỏ qua|tiếp|câu tiếp|next|submit|start|stop|gửi|skip)$/.test(t);
   }
 
-  /* --- loại bộ "đáp án giả" (thanh số câu 1..40) --- */
-  function looksLikeNavigator(nodes) {
-    if (!nodes || nodes.length > MAX_OPTIONS) return true;
-    const texts = nodes.map(cleanText);
-    if (!texts.length) return true;
-    const numeric = texts.filter(t => /^\d{1,3}$/.test(t)).length;
-    if (texts.length > 6 && numeric / texts.length > 0.6) return true;
-    return false;
-  }
-
-  function optionSetScore(nodes) {
-    if (!nodes || nodes.length < 2 || nodes.length > MAX_OPTIONS) return -1;
-    if (looksLikeNavigator(nodes)) return -1;
-    const texts = nodes.map(cleanText).filter(t => t.length);
-    if (texts.length < 2) return -1;
-    let score = 0;
-    if (texts.some(t => t.length >= 8)) score += 3;
-    if (nodes.some(n => n.querySelector && n.querySelector('input[type="radio"], input[type="checkbox"]'))) score += 3;
-    const cls = (typeof nodes[0].className === "string" ? nodes[0].className : "").toLowerCase();
-    if (/answer|choice|option|select/.test(cls)) score += 2;
-    score += Math.min(texts.length, 6);
-    return score;
+  function optionText(el) {
+    if (!el) return "";
+    const c = el.querySelector && el.querySelector(".question-option-content");
+    if (c) { const t = cleanText(c); if (t) return t; }
+    let t = cleanText(el);
+    t = t.replace(/^[A-F]\s*[.)]?\s+/i, "");
+    return t;
   }
 
   function getOptionNodes() {
-    const candidates = [];
-
     for (let s = 0; s < OPTION_SELECTORS.length; s++) {
-      let nodes = [];
+      let nodes;
       try { nodes = Array.from(document.querySelectorAll(OPTION_SELECTORS[s])); } catch (e) { continue; }
-      nodes = nodes.filter(n => !insideGui(n) && isVisible(n) && !isButtonLike(n));
-      if (nodes.length < 2) continue;
+      nodes = nodes.filter(n => n.isConnected && !insideChrome(n) && !isButtonLike(n) && isVisible(n));
+      if (nodes.length < 2 || nodes.length > MAX_OPTIONS) continue;
       const inner = nodes.filter(n => !nodes.some(m => m !== n && n.contains(m)));
-      if (inner.length >= 2) candidates.push(inner);
+      if (inner.length < 2) continue;
+      const texts = inner.map(optionText).filter(t => t.length > 0);
+      if (texts.length < 2) continue;
+      const numeric = texts.filter(t => /^\d{1,3}$/.test(t)).length;
+      if (numeric >= texts.length) continue;
+      return inner;
     }
-
-    const radios = Array.from(document.querySelectorAll('input[type="radio"], input[type="checkbox"]'))
-      .filter(r => !insideGui(r) && r.name && !r.disabled && isVisible(r));
-    if (radios.length >= 2) {
-      const groups = {};
-      radios.forEach(r => { (groups[r.name] = groups[r.name] || []).push(r); });
-      Object.keys(groups).forEach(k => {
-        const g = groups[k];
-        if (g.length >= 2 && g.length <= MAX_OPTIONS) {
-          const wrapped = g.map(r => r.closest("label") || r.parentElement).filter(Boolean);
-          const uniq = wrapped.filter((n, i) => wrapped.indexOf(n) === i);
-          if (uniq.length >= 2) candidates.push(uniq);
-        }
-      });
-    }
-
-    let best = null, bestScore = -1;
-    for (let i = 0; i < candidates.length; i++) {
-      const sc = optionSetScore(candidates[i]);
-      if (sc > bestScore) { bestScore = sc; best = candidates[i]; }
-    }
-    return bestScore > 0 ? best : [];
-  }
-
-  function extractLeafStem(root, options) {
-    const parts = [];
-    function walk(node) {
-      if (!node || node.nodeType !== 1) return;
-      if (insideGui(node)) return;
-      for (let i = 0; i < options.length; i++) if (options[i] === node || options[i].contains(node)) return;
-      const kids = Array.from(node.children);
-      if (!kids.length) {
-        const t = cleanText(node);
-        if (t && t.length >= 4 && !/^[\d\s.,/:\-]+$/.test(t)) parts.push(t);
-        return;
-      }
-      kids.forEach(walk);
-    }
-    walk(root);
-    let out = "";
-    for (let i = 0; i < parts.length && out.length < 1200; i++) out += (out ? " " : "") + parts[i];
-    return out.trim();
-  }
-
-  function getStem(options) {
-    if (!options || !options.length) return "";
-    const optTexts = options.map(cleanText).filter(t => t.length);
-
-    let anc = options[0], guard = 0;
-    while (anc && !options.every(o => anc.contains(o)) && guard++ < 40) anc = anc.parentElement;
-    if (!anc) return "";
-
-    let cur = anc;
-    for (let i = 0; i < 6; i++) {
-      if (!cur.parentElement || cur.parentElement === document.body) break;
-      if (cleanText(cur.parentElement).length > cleanText(cur).length + 15) cur = cur.parentElement;
-      else break;
-    }
-
-    let full = cleanText(cur);
-
-    const longOpts = optTexts.filter(t => t.length >= 4);
-    for (let i = 0; i < longOpts.length; i++) {
-      const idx = full.indexOf(longOpts[i]);
-      if (idx > 5) { full = full.slice(0, idx); break; }
-    }
-
-    full = full.replace(/(^|\s)(\d{1,3}\s+){3,}/g, " ").replace(/\s+/g, " ").trim();
-
-    if (full.length >= 20) return full.slice(0, 2000);
-
-    const leaf = extractLeafStem(cur, options);
-    if (leaf.length >= 10) return leaf.slice(0, 2000);
-    return (full || cleanText(cur)).slice(0, 2000);
-  }
-
-  function findButton(re) {
-    const nodes = document.querySelectorAll('button, a, div[role="button"], [class*="btn"], [class*="button"]');
-    const list = [];
-    for (let i = 0; i < nodes.length; i++) {
-      const n = nodes[i];
-      if (!n.isConnected || insideGui(n) || !isVisible(n)) continue;
-      const t = cleanText(n);
-      if (!t || t.length > 40) continue;
-      if (re.test(t)) list.push(n);
-    }
-    const inner = list.filter(n => !list.some(m => m !== n && n.contains(m)));
-    if (!inner.length) return null;
-    inner.sort((a, b) => cleanText(a).length - cleanText(b).length);
-    return inner[0];
+    return [];
   }
 
   function isOptionSelected(el) {
@@ -434,6 +323,11 @@
   function selectOption(el) {
     if (!el) return false;
     if (isOptionSelected(el)) return true;
+
+    // click thẳng vào khối đáp án (site bind event ở đây)
+    clickEl(el);
+    if (isOptionSelected(el)) return true;
+
     const input = el.querySelector('input[type="radio"], input[type="checkbox"]');
     if (input) {
       try { input.click(); } catch (e) {}
@@ -443,67 +337,223 @@
         input.dispatchEvent(new Event("change", { bubbles: true }));
       }
     }
-    if (!isOptionSelected(el)) clickEl(el);
     return isOptionSelected(el);
   }
 
-  function detectFeedback(options) {
-    const correct = new Set(), wrong = new Set();
-    const OK  = ["correct", "true", "right", "success", "dung", "đúng", "answer-correct", "is-correct"];
-    const BAD = ["incorrect", "wrong", "false", "error", "sai", "answer-wrong", "is-wrong", "is-incorrect"];
-    options.forEach((o, i) => {
-      const cls = (typeof o.className === "string" ? o.className : "").toLowerCase();
-      const parts = cls.split(/\s+/).filter(Boolean);
-      if (parts.some(p => OK.indexOf(p) >= 0))  correct.add(i);
-      if (parts.some(p => BAD.indexOf(p) >= 0)) wrong.add(i);
-    });
-    return { correct: correct, wrong: wrong };
+  /* ================= DOM: ĐỀ BÀI ================= */
+  function getQuestionNo() {
+    const n = document.querySelector("#test-step-question .question-header .num") ||
+              document.querySelector(".question-header .num");
+    if (!n) return "";
+    const t = cleanText(n);
+    const m = t.match(/(?:câu|question)\s*[:.]?\s*(\d+)/i) || t.match(/(\d+)/);
+    return m ? m[1] : "";
   }
 
-  /* ================= APPLY / VERIFY ================= */
+  function extractLeafStem(root, options) {
+    const parts = [];
+    function walk(node) {
+      if (!node || node.nodeType !== 1) return;
+      if (insideChrome(node)) return;
+      for (let i = 0; i < options.length; i++) if (options[i] === node || options[i].contains(node)) return;
+      const kids = Array.from(node.children);
+      if (!kids.length) {
+        const t = cleanText(node);
+        if (t && t.length >= 4 && !/^[\d\s.,/:\-]+$/.test(t)) parts.push(t);
+        return;
+      }
+      kids.forEach(walk);
+    }
+    walk(root);
+    let out = "";
+    for (let i = 0; i < parts.length && out.length < 1500; i++) out += (out ? " " : "") + parts[i];
+    return out.trim();
+  }
+
+  function getStem(options) {
+    // 1) onluyen school-test: .question-name (+ đoạn văn .question-text)
+    const qn = document.querySelector("#test-step-question .question-name") || document.querySelector(".question-name");
+    if (qn) {
+      const parts = [];
+      const qt = document.querySelector("#test-step-question .question-text");
+      if (qt) { const t = cleanText(qt); if (t && t.length > 10) parts.push(t); }
+      const t2 = cleanText(qn);
+      if (t2) parts.push(t2);
+      const out = parts.join("\n").trim();
+      if (out.length >= 5) return out.slice(0, 2500);
+    }
+
+    // 2) generic
+    if (!options || !options.length) return "";
+    const optTexts = options.map(optionText).filter(t => t.length);
+
+    let anc = options[0], guard = 0;
+    while (anc && !options.every(o => anc.contains(o)) && guard++ < 40) anc = anc.parentElement;
+    if (!anc) return "";
+
+    let cur = anc;
+    for (let i = 0; i < 6; i++) {
+      if (!cur.parentElement || cur.parentElement === document.body) break;
+      if (cleanText(cur.parentElement).length > cleanText(cur).length + 15) cur = cur.parentElement;
+      else break;
+    }
+
+    let full = cleanText(cur);
+    const longOpts = optTexts.filter(t => t.length >= 4);
+    for (let i = 0; i < longOpts.length; i++) {
+      const idx = full.indexOf(longOpts[i]);
+      if (idx > 5) { full = full.slice(0, idx); break; }
+    }
+    full = full.replace(/(^|\s)(\d{1,3}\s+){3,}/g, " ").replace(/\s+/g, " ").trim();
+    if (full.length >= 20) return full.slice(0, 2500);
+
+    const leaf = extractLeafStem(cur, options);
+    if (leaf.length >= 10) return leaf.slice(0, 2500);
+    return (full || cleanText(cur)).slice(0, 2500);
+  }
+
+  /* ================= DOM: TIẾN ĐỘ / ĐIỀU HƯỚNG ================= */
+  function getAnsweredCount() {
+    const report = document.querySelector(".left-side .report");
+    if (!report) return null;
+    const fields = Array.from(report.querySelectorAll(".field"));
+    for (let i = 0; i < fields.length; i++) {
+      const f = fields[i];
+      const name = cleanText(f.querySelector(".field-name") || f);
+      if (/đã làm/i.test(name)) {
+        const v = parseInt(cleanText(f.querySelector(".field-value") || f), 10);
+        if (!isNaN(v)) return v;
+      }
+    }
+    return null;
+  }
+
+  function getProgress() {
+    const sheet = document.querySelector(".answer-sheet");
+    if (!sheet) return null;
+    const opts = Array.from(sheet.querySelectorAll(".option"));
+    if (!opts.length) return null;
+    let done = 0, active = -1;
+    for (let i = 0; i < opts.length; i++) {
+      const c = typeof opts[i].className === "string" ? opts[i].className : "";
+      if (/(^|\s)(done|answered)(\s|$)/i.test(c)) done++;
+      if (/(^|\s)active(\s|$)/i.test(c)) active = i;
+    }
+    return { total: opts.length, done: done, active: active, list: opts };
+  }
+
+  const NEXT_RE = /(câu tiếp|tiếp theo|câu sau|câu kế|kế tiếp|next)/i;
+
+  function findNextNav() {
+    // 1) chevron phải ở thanh mobile
+    const bar = document.querySelector(".mobile-bottom-bar");
+    if (bar) {
+      const btns = Array.from(bar.querySelectorAll("button.nav-btn"));
+      for (let i = 0; i < btns.length; i++) {
+        const b = btns[i];
+        const isRight = b.querySelector(".fa-chevron-right, .fa-angle-right") || i === btns.length - 1;
+        if (isRight && !b.querySelector(".fa-chevron-left") && !isDisabled(b) && isVisible(b)) return b;
+      }
+    }
+    // 2) ô số kế tiếp trong phiếu trả lời
+    const p = getProgress();
+    if (p && p.active >= 0 && p.active + 1 < p.list.length) return p.list[p.active + 1];
+    // 3) chevron bất kỳ
+    const all = document.querySelectorAll(".nav-btn");
+    for (let i = 0; i < all.length; i++) {
+      const b = all[i];
+      if (b.querySelector(".fa-chevron-right, .fa-angle-right") && !isDisabled(b)) return b;
+    }
+    // 4) nút chữ "Tiếp"
+    const nodes = document.querySelectorAll('button, a, [role="button"]');
+    for (let i = 0; i < nodes.length; i++) {
+      const n = nodes[i];
+      if (!n.isConnected || insideChrome(n) || !isVisible(n)) continue;
+      const t = cleanText(n);
+      if (!t || t.length > 30) continue;
+      if (BAD_BTN_RE.test(t)) continue;
+      if (NEXT_RE.test(t)) return n;
+    }
+    return null;
+  }
+
+  function findCheckButton() {
+    const nodes = document.querySelectorAll('button, a, [role="button"]');
+    for (let i = 0; i < nodes.length; i++) {
+      const n = nodes[i];
+      if (!n.isConnected || insideChrome(n) || !isVisible(n)) continue;
+      const t = cleanText(n);
+      if (!t || t.length > 30) continue;
+      if (BAD_BTN_RE.test(t)) continue;
+      if (/^(kiểm tra|check|kiểm tra đáp án|trả lời)$/i.test(t)) return n;
+    }
+    return null;
+  }
+
+  /* ================= APPLY + VERIFY ================= */
   async function applySelection(indices) {
+    const before = getAnsweredCount();
+
+    let opts = getOptionNodes();
+    if (!opts.length) return false;
+    for (let k = 0; k < indices.length; k++) {
+      const el = opts[indices[k]];
+      if (el && !isOptionSelected(el)) selectOption(el);
+    }
+    await sleep(450);
+
     for (let round = 1; round <= RE_CHECK_ROUNDS; round++) {
-      const opts = getOptionNodes();
-      if (!opts.length) return false;
+      opts = getOptionNodes();
+      let ok = 0;
+      for (let k = 0; k < indices.length; k++) {
+        const el = opts[indices[k]];
+        if (el && isOptionSelected(el)) ok++;
+      }
+      if (ok === indices.length) return true;
+
+      const now = getAnsweredCount();
+      if (before !== null && now !== null && now > before) {
+        log("Site ghi nhận đáp án (bộ đếm " + before + " → " + now + ")", "ok");
+        return true;
+      }
+      if (round >= RE_CHECK_ROUNDS) break;
+
+      // chỉ click lại những cái CHƯA chọn
       for (let k = 0; k < indices.length; k++) {
         const el = opts[indices[k]];
         if (el && !isOptionSelected(el)) selectOption(el);
       }
-      await sleep(180 * round);
-      const after = getOptionNodes();
-      let ok = 0;
-      for (let k = 0; k < indices.length; k++) {
-        const el = after[indices[k]];
-        if (el && isOptionSelected(el)) ok++;
-      }
-      if (ok === indices.length) return true;
-      log("Kiểm tra lại " + round + "/" + RE_CHECK_ROUNDS + ": " + ok + "/" + indices.length + " đã chọn", "warn");
+      await sleep(300 * round);
+      log("Kiểm tra lại " + round + "/" + RE_CHECK_ROUNDS + " (" + ok + "/" + indices.length + " đã chọn)", "warn");
     }
     return false;
   }
 
   async function clickSubmitBtn() {
-    if (state.answered < 0) return false;
+    const before = getAnsweredCount();
     const opts = getOptionNodes();
-    if (opts.length && !opts.some(isOptionSelected)) {
-      log("Chưa chọn được đáp án nào — KHÔNG bấm nộp.", "warn");
-      return false;
-    }
-    const btn = findButton(SUBMIT_RE);
-    if (!btn || isDisabled(btn)) return false;
+    const anySelected = opts.some(isOptionSelected) || (before !== null && before > 0);
+    if (!anySelected) { log("Chưa chọn được đáp án nào — KHÔNG bấm nộp.", "warn"); return false; }
+
+    const btn = findCheckButton();
+    if (!btn) return false;   // trang này không có nút kiểm tra từng câu
     clickEl(btn);
-    log("Đã bấm nút nộp/kiểm tra", "ok");
+    log("Đã bấm nút kiểm tra", "ok");
     return true;
+  }
+
+  function currentSig() {
+    const opts = getOptionNodes();
+    if (!opts.length) return "";
+    return hashStr(getQuestionNo() + "||" + getStem(opts) + "||" + opts.map(optionText).join("|"));
   }
 
   async function waitForChange(oldSig, timeoutMs) {
     const t0 = Date.now();
     while (Date.now() - t0 < (timeoutMs || NEXT_WAIT)) {
       await sleep(250);
-      const opts = getOptionNodes();
-      if (!opts.length) continue;
-      const sig = hashStr(getStem(opts) + "||" + opts.map(cleanText).join("|"));
-      if (sig && sig !== oldSig) return true;
+      const s = currentSig();
+      if (s && s !== oldSig) return true;
     }
     return false;
   }
@@ -518,36 +568,44 @@
     return [];
   }
 
-  /* --- chuyển câu: TUYỆT ĐỐI không tự nộp bài trừ khi bật --- */
+  /* ================= CHUYỂN CÂU ================= */
   async function advance(prevSig) {
-    await sleep(350);
+    await sleep(300);
 
-    const next = findButton(NEXT_RE);
-    if (next && !isDisabled(next)) {
-      clickEl(next);
-      log("→ Câu tiếp", "ok");
+    const nav = findNextNav();
+    if (nav && !isDisabled(nav)) {
+      clickEl(nav);
       if (await waitForChange(prevSig, NEXT_WAIT)) return true;
-      const again = findButton(NEXT_RE);
-      if (again && !isDisabled(again)) {
+
+      const again = findNextNav();
+      if (again && !isDisabled(again) && again !== nav) {
         clickEl(again);
-        if (await waitForChange(prevSig, 5000)) return true;
+        if (await waitForChange(prevSig, 6000)) return true;
       }
       return false;
     }
 
-    if (getAutoSubmit() && state.answered > 0) {
-      const fin = findButton(FINAL_RE);
-      if (fin && !isDisabled(fin)) {
-        clickEl(fin);
-        log("Đã nộp bài (do bật 'Tự nộp bài cuối').", "ok");
+    const p = getProgress();
+    const allDone = p && p.total > 0 && p.done >= p.total;
+
+    if (allDone && getAutoSubmit()) {
+      const headerBtn = Array.from(document.querySelectorAll(".submit-button button, button"))
+        .find(b => !insideChrome(b) && isVisible(b) && /nộp bài/i.test(cleanText(b)));
+      if (headerBtn && !isDisabled(headerBtn)) {
+        clickEl(headerBtn);
+        log("Đã bấm 'Nộp Bài' (do bật Tự nộp bài).", "warn");
         setStatus("Hoàn tất");
+        await sleep(1200);
+        const confirm = Array.from(document.querySelectorAll("button"))
+          .find(b => isVisible(b) && !insideChrome(b) && /^(đồng ý|xác nhận|nộp bài|ok)$/i.test(cleanText(b)));
+        if (confirm) clickEl(confirm);
         stop();
         return true;
       }
-    } else {
-      log("Không thấy nút chuyển câu. KHÔNG tự nộp bài. Bật 'Tự nộp bài cuối' nếu muốn.", "warn");
-      setStatus("Chờ câu tiếp...");
     }
+
+    log("Không tìm thấy nút chuyển câu. KHÔNG tự nộp bài.", "warn");
+    setStatus("Chờ nút chuyển câu...");
     return false;
   }
 
@@ -556,7 +614,7 @@
     if (ok) { state.advanceFail = 0; return true; }
     state.advanceFail++;
     if (state.advanceFail >= 10) {
-      log("Kẹt 10 lần không chuyển được câu — tự dừng để tránh treo.", "err");
+      log("Kẹt 10 lần không chuyển được câu — tự dừng.", "err");
       setStatus("Bị kẹt — đã dừng");
       stop();
     }
@@ -575,22 +633,26 @@
     let options = getOptionNodes();
 
     if (!options.length) {
-      const ta = Array.from(document.querySelectorAll("textarea")).find(t => !insideGui(t) && isVisible(t));
+      const ta = Array.from(document.querySelectorAll("textarea"))
+        .find(t => !insideChrome(t) && isVisible(t) && !insideGui(t));
       if (ta) { await handleEssay(ta); return; }
 
       state.idleTicks++;
       if (state.idleTicks === 1 || state.idleTicks % 5 === 0) {
-        log("Chưa thấy câu hỏi (có thể trang đang tải)... chờ.", "warn");
+        log("Chưa thấy đáp án... chờ trang render.", "warn");
         setStatus("Đang chờ câu hỏi...");
       }
       options = await waitForOptions(QUESTION_WAIT_MS);
-      if (!options.length) return;   // KHÔNG nhảy câu, KHÔNG nộp
+      if (!options.length) return;
     }
     state.idleTicks = 0;
 
     const stem     = getStem(options);
-    const optTexts = options.map(cleanText);
-    const sig      = hashStr(stem + "||" + optTexts.join("|"));
+    const optTexts = options.map(optionText);
+    const qno      = getQuestionNo();
+    const sig      = hashStr(qno + "||" + stem + "||" + optTexts.join("|"));
+
+    log("Câu " + (qno || "?") + " · " + options.length + " đáp án · " + stem.slice(0, 80).replace(/\n/g, " "));
 
     if (state.solvedSigs.has(sig)) {
       log("Câu này đã giải trong phiên — chuyển tiếp.");
@@ -608,23 +670,24 @@
       return;
     }
 
-    const fb0 = detectFeedback(options);
-    const alreadyAnswered = fb0.correct.size > 0 || fb0.wrong.size > 0;
-
-    if (alreadyAnswered && !getReSolveDone()) {
-      log("Câu đã có đáp án — bỏ qua (bật 'Làm lại câu đã đúng' để giải lại).");
-      state.solvedSigs.add(sig);
-      await safeAdvance(sig);
-      return;
+    if (!getReSolveDone()) {
+      const cnt = getAnsweredCount();
+      const p = getProgress();
+      const already = (p && p.active >= 0 && /(^|\s)(done|answered)(\s|$)/i.test(p.list[p.active].className)) ||
+                      options.some(isOptionSelected);
+      if (already) {
+        log("Câu đã làm — bỏ qua (bật 'Làm lại câu đã đúng' để giải lại).");
+        state.solvedSigs.add(sig);
+        await safeAdvance(sig);
+        return;
+      }
     }
-
-    log("Câu: " + stem.slice(0, 100).replace(/\n/g, " "));
 
     let indices = null;
     const cached = state.cache.get(sig);
     if (cached) {
       indices = cached.slice();
-      log("Dùng cache: " + indices.map(i => String.fromCharCode(65 + i)).join(", "));
+      log("Cache: " + indices.map(i => String.fromCharCode(65 + i)).join(", "));
     } else {
       setStatus("Đang hỏi AI...");
       let text;
@@ -633,7 +696,7 @@
 
       indices = parseAnswer(text, optTexts.length);
       if (!indices.length) {
-        log("AI không trả về đáp án đọc được — chờ câu khác (không nộp).", "err");
+        log("AI không trả về đáp án đọc được — chờ, KHÔNG nộp.", "err");
         setStatus("AI trả lời không đọc được");
         return;
       }
@@ -649,7 +712,7 @@
     while (attempt <= MAX_ANSWER_RETRY) {
       setStatus("Đang chọn đáp án...");
       const applied = await applySelection(indices);
-      if (!applied) log("Chưa xác nhận được đáp án đã chọn.", "warn");
+      if (!applied) log("Chưa xác nhận được đáp án.", "warn");
 
       let fb = detectFeedback(getOptionNodes());
 
@@ -658,7 +721,6 @@
         attempt++;
         if (attempt > MAX_ANSWER_RETRY) break;
         setStatus("Sai — xin đáp án khác...");
-        log("Sai (" + prevWrong.join(", ") + ") → chọn lại", "warn");
         const nxt = await reAsk(stem, optTexts, prevWrong);
         if (!nxt.length) break;
         indices = nxt.filter(i => prevWrong.indexOf(String.fromCharCode(65 + i)) < 0);
@@ -666,21 +728,18 @@
         state.cache.set(sig, indices.slice());
         continue;
       }
-
       if (fb.correct.size) { log("Đã đúng.", "ok"); solvedOk = true; break; }
 
       const clicked = await clickSubmitBtn();
-      if (!clicked) break;
+      if (!clicked) { solvedOk = applied; break; }
 
       await sleep(800);
       fb = detectFeedback(getOptionNodes());
-
       if (fb.wrong.size && indices.some(i => fb.wrong.has(i))) {
         prevWrong = prevWrong.concat(indices.map(i => String.fromCharCode(65 + i)));
         attempt++;
         if (attempt > MAX_ANSWER_RETRY) break;
         setStatus("Sai — chọn lại...");
-        log("Nộp xong bị sai → chọn đáp án khác", "warn");
         const nxt = await reAsk(stem, optTexts, prevWrong);
         if (!nxt.length) break;
         indices = nxt.filter(i => prevWrong.indexOf(String.fromCharCode(65 + i)) < 0);
@@ -688,28 +747,37 @@
         state.cache.set(sig, indices.slice());
         continue;
       }
-
       solvedOk = true;
       break;
     }
 
-    if (solvedOk) {
-      state.answered++;
-      state.solvedSigs.add(sig);
-    }
+    if (solvedOk) { state.answered++; state.solvedSigs.add(sig); }
 
     setStatus("Đang chuyển câu...");
     await safeAdvance(sig);
   }
 
+  function detectFeedback(options) {
+    const correct = new Set(), wrong = new Set();
+    const OK  = ["correct", "true", "right", "success", "dung", "đúng", "answer-correct", "is-correct"];
+    const BAD = ["incorrect", "wrong", "false", "error", "sai", "answer-wrong", "is-wrong", "is-incorrect"];
+    options.forEach((o, i) => {
+      const cls = (typeof o.className === "string" ? o.className : "").toLowerCase();
+      const parts = cls.split(/\s+/).filter(Boolean);
+      if (parts.some(p => OK.indexOf(p) >= 0))  correct.add(i);
+      if (parts.some(p => BAD.indexOf(p) >= 0)) wrong.add(i);
+    });
+    return { correct: correct, wrong: wrong };
+  }
+
   async function handleEssay(ta) {
     if ((ta.value || "").trim().length > 3) {
       log("Ô trả lời đã có nội dung — chuyển câu.");
-      state.solvedSigs.add(hashStr(cleanText(ta) + "||essay"));
-      await safeAdvance(hashStr(cleanText(ta) + "||essay"));
+      const s = hashStr(cleanText(ta) + "||essay");
+      state.solvedSigs.add(s);
+      await safeAdvance(s);
       return;
     }
-
     let box = ta.parentElement;
     for (let i = 0; i < 4 && box; i++) { if (cleanText(box).length > 40) break; box = box.parentElement; }
     const stem = cleanText(box || ta).slice(0, 1500);
@@ -724,13 +792,13 @@
       const text = await askWithFallback(msgs, getModel());
       setNativeValue(ta, text.trim());
       log("Đã điền câu trả lời tự luận.", "ok");
-      await sleep(300);
-      const btn = findButton(SUBMIT_RE);
+      await sleep(400);
+      const btn = findCheckButton();
       if (btn && !isDisabled(btn)) { clickEl(btn); await sleep(700); }
       state.answered++;
-      const sig = hashStr(stem + "||essay");
-      state.solvedSigs.add(sig);
-      await safeAdvance(sig);
+      const s = hashStr(stem + "||essay");
+      state.solvedSigs.add(s);
+      await safeAdvance(s);
     } catch (e) { log("Lỗi tự luận: " + e.message, "err"); }
   }
 
@@ -742,7 +810,7 @@
     try { await solveCurrent(); }
     catch (e) { log("Lỗi vòng lặp: " + (e && e.message ? e.message : e), "err"); }
     finally {
-      if (Date.now() - started > 120000) log("Vòng lặp chạy quá lâu — đã reset.", "warn");
+      if (Date.now() - started > 120000) log("Vòng lặp quá lâu — reset.", "warn");
       state.busy = false;
     }
     if (state.running) state.timers.push(setTimeout(tick, getInterval()));
@@ -837,7 +905,7 @@
 
     root.innerHTML =
       '<div class="ais-head" id="ais-head">' +
-        '<span>⚡ ai slover v38.6</span>' +
+        '<span>⚡ ai slover v38.7</span>' +
         '<span class="ais-min" id="ais-min">–</span>' +
       '</div>' +
       '<div class="ais-body" id="ais-body">' +
@@ -852,7 +920,7 @@
         '</div>' +
         '<div class="ais-status" id="ais-status">Sẵn sàng</div>' +
         '<div class="ais-log" id="ais-log"></div>' +
-        '<div class="ais-foot">v38.6 · không tự nộp bài · DeepSeek mặc định</div>' +
+        '<div class="ais-foot">v38.7 · đọc .question-option · không bấm Bỏ qua</div>' +
       '</div>';
     document.body.appendChild(root);
 
@@ -891,7 +959,7 @@
     });
     chkAuto.addEventListener("change", function () {
       localStorage.setItem(AUTOSUBMIT_KEY, chkAuto.checked ? "true" : "false");
-      if (chkAuto.checked) log("⚠ Đã bật tự nộp bài cuối!", "warn");
+      if (chkAuto.checked) log("⚠ Đã bật tự nộp bài!", "warn");
     });
 
     document.getElementById("ais-start").addEventListener("click", e => { e.preventDefault(); start(); });
@@ -915,9 +983,8 @@
     }
     function moveDrag(cx, cy) {
       if (!dragging) return;
-      const nx = Math.max(0, Math.min(window.innerWidth  - 60, ox + (cx - sx)));
-      const ny = Math.max(0, Math.min(window.innerHeight - 40, oy + (cy - sy)));
-      root.style.left = nx + "px"; root.style.top = ny + "px";
+      root.style.left = Math.max(0, Math.min(window.innerWidth  - 60, ox + (cx - sx))) + "px";
+      root.style.top  = Math.max(0, Math.min(window.innerHeight - 40, oy + (cy - sy))) + "px";
     }
     head.addEventListener("mousedown", e => startDrag(e.clientX, e.clientY));
     head.addEventListener("touchstart", e => { const p = e.touches[0]; startDrag(p.clientX, p.clientY); }, { passive: true });
