@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         AI Solver v39.9
+// @name         AI Solver v40.1
 // @namespace    https://github.com/memaygayy/QuG6ok8gR0FZ
-// @version      39.9.0
-// @description  Tự động giải trắc nghiệm / điền từ / tự luận / blank-numbered / đáp án hình ảnh trên onluyen.vn (model FREE)
+// @version      40.1.0
+// @description  Tự động giải trắc nghiệm / điền từ / tự luận / blank-numbered / đáp án hình / đúng-sai trên onluyen.vn
 // @author       memaygayy
 // @match        https://*.onluyen.vn/*
 // @match        https://onluyen.vn/*
@@ -19,55 +19,64 @@
 
 (function () {
   "use strict";
-  if (window.__AI_SOLVER_39_9__) return;
-  window.__AI_SOLVER_39_9__ = true;
+  if (window.__AI_SOLVER_40_1__) return;
+  window.__AI_SOLVER_40_1__ = true;
 
   /* ============================ CONFIG ============================ */
-  const VERSION_STR = "39.9.0";
+  const VERSION_STR = "40.1.0";
   const GUI_ID = "ai-solver-v38";
-  const PROXY_URL = "https://gen.pollinations.ai/v1/chat/completions";
+
+  const ENDPOINTS = [
+    "https://gen.pollinations.ai/v1/chat/completions",
+    "https://text.pollinations.ai/openai"
+  ];
   const MODELS_URLS = [
     "https://text.pollinations.ai/models",
     "https://gen.pollinations.ai/models"
   ];
+
   const POLL_KEY = "sk_D8PP0K4jFUDUa0zjrx7uxq1XM1ZoVINK";
 
-  const MODEL_KEY = "HW_SOLVER_MODEL_V3";          // bump V2 -> V3 để bỏ model trả phí cũ
+  const MODEL_KEY = "HW_SOLVER_MODEL_V3";
   const MODEL_CUSTOM_KEY = "HW_SOLVER_MODEL_CUSTOM";
   const MODEL_WORKING = "HW_SOLVER_MODEL_WORKING_V3";
+  const COMBO_KEY = "HW_SOLVER_WORKING_COMBO";
   const PAID_KEY = "HW_SOLVER_PAID_MODELS";
   const INTERVAL_KEY = "HW_SOLVER_INTERVAL";
   const VERIFY_KEY = "HW_SOLVER_VERIFY";
   const AUTOSUBMIT_KEY = "HW_SOLVER_AUTO_SUBMIT";
   const REDO_KEY = "HW_SOLVER_REDO_DONE";
   const VISION_KEY = "HW_SOLVER_VISION";
+  const APIKEY_KEY = "HW_SOLVER_API_KEY";
+  const USEKEY_KEY = "HW_SOLVER_USE_KEY";
 
-  // Model FREE + mạnh. gemini free và đọc được ảnh.
-  const DEFAULT_MODEL = "gemini";
-  const FALLBACK_MODELS = ["gemini", "openai-fast", "openai", "mistral", "deepseek", "qwen-coder", "nova-fast"];
+  const DEFAULT_MODEL = "openai-fast";
+  const FALLBACK_MODELS = ["openai", "mistral", "qwen-coder", "nova-fast", "gemini", "llama", "deepseek"];
   const MODEL_CHOICES = [
-    "gemini", "openai-fast", "openai", "mistral",
-    "deepseek", "qwen-coder", "nova-fast", "llama", "claude",
+    "openai-fast", "openai", "mistral", "qwen-coder", "nova-fast",
+    "gemini", "llama", "deepseek", "openai-large", "claude",
     "deepseek/deepseek-v4-flash"
   ];
-  const VISION_MODELS = ["gemini", "openai", "openai-fast", "openai-large", "mistral"];
+  const VISION_MODELS = ["gemini", "openai", "openai-large", "openai-fast", "mistral", "claude"];
 
   const MAX_OPTIONS = 12;
-  const API_TIMEOUT = 35000;
-  const VISION_TIMEOUT = 45000;
-  const ASK_BUDGET_MS = 95000;
-  const VISION_BUDGET_MS = 110000;
-  const WATCHDOG_MS = 60000;
+  const API_TIMEOUT = 30000;
+  const VISION_TIMEOUT = 40000;
+  const ASK_BUDGET_MS = 85000;
+  const VISION_BUDGET_MS = 85000;
+  const WATCHDOG_MS = 150000;
   const MAX_VISION_BYTES = 4000000;
 
   const BAD_BTN_RE = /(bỏ qua|skip|nộp bài|nộp|xác nhận nộp|hủy|huỷ|cancel|thoát|đóng|close|báo lỗi)/i;
   const NEXT_RE = /(câu tiếp|câu sau|tiếp theo|câu kế|kế tiếp|next)/i;
   const ANSWER_BTN_RE = /(trả lời|làm bài|kiểm tra|xác nhận|gửi|lưu|answer)/i;
 
+  const ERR_TEXT_RE = /(not enough credits|enough credits|needs paid pollen|paid pollen|top[ -]?up|insufficient (credit|balance|pollen|quota)|payment required|too many requests|rate[ -]?limit|invalid api key|api key (is )?(invalid|missing|required|not)|model not found|no such model|unauthorized|quota exceeded|account .*suspended|please (log ?in|sign ?in))/i;
+  const PAID_TEXT_RE = /(credit|pollen|top[ -]?up|payment|balance|quota|insufficient|paid)/i;
+
   /* ============================ STATE ============================ */
   let running = false;
   let genToken = 0;
-  let pendingTokens = 0;
   const logBuf = [];
 
   /* ============================ UTILS ============================ */
@@ -97,6 +106,10 @@
     if (el.closest(".mobile-bottom-bar")) return true;
     if (el.closest(".left-side")) return true;
     return false;
+  }
+  function escSel(s) {
+    try { return CSS.escape(String(s)); }
+    catch (e) { return String(s).replace(/[^\w-]/g, "\\$&"); }
   }
 
   function log(msg) {
@@ -146,6 +159,12 @@
   function getVisionEnabled() { return lsBool(VISION_KEY, true); }
   function getRedo() { return lsBool(REDO_KEY, true); }
   function getAutoSubmit() { return lsBool(AUTOSUBMIT_KEY, false); }
+  function getUseKey() { return lsBool(USEKEY_KEY, true); }
+
+  function getApiKey() {
+    const custom = (lsGet(APIKEY_KEY, "") || "").trim();
+    return custom || POLL_KEY;
+  }
 
   function getModel() {
     const custom = (lsGet(MODEL_CUSTOM_KEY, "") || "").trim();
@@ -153,13 +172,20 @@
     const m = (lsGet(MODEL_KEY, "") || "").trim();
     return m || DEFAULT_MODEL;
   }
-  function setModel(m) {
-    if (!m) return;
-    lsSet(MODEL_KEY, m);
-    if ((lsGet(MODEL_CUSTOM_KEY, "") || "").trim() === m) lsSet(MODEL_CUSTOM_KEY, "");
-  }
   function getWorkingModel() { return (lsGet(MODEL_WORKING, "") || "").trim(); }
   function setWorkingModel(m) { if (m) lsSet(MODEL_WORKING, m); }
+
+  function getWorkingCombo() {
+    const raw = lsGet(COMBO_KEY, "");
+    if (!raw) return null;
+    const p = raw.split("|");
+    if (p.length < 3) return null;
+    return { model: p[0], ep: parseInt(p[1], 10) || 0, useKey: p[2] === "k" };
+  }
+  function setWorkingCombo(c) {
+    if (!c) return;
+    lsSet(COMBO_KEY, c.model + "|" + c.ep + "|" + (c.useKey ? "k" : "a"));
+  }
 
   function getPaidSet() {
     try {
@@ -206,9 +232,19 @@
   }
 
   function isPaidError(status, msg) {
-    const s = String(msg || "").toLowerCase();
     if (status === 402) return true;
-    return /not enough credits|top up|needs paid|insufficient|balance|pollen.*(credit|paid)|paid pollen|requires? (a )?paid/i.test(s);
+    const s = String(msg || "");
+    return PAID_TEXT_RE.test(s) && /credit|pollen|top[ -]?up|payment|balance|quota|insufficient/i.test(s);
+  }
+
+  function detectApiErrorText(text) {
+    const s = String(text || "").trim();
+    if (!s) return "";
+    if (s.length > 900) return "";
+    if (/"(answer|answers|dap_an|dapAn|choice|result|key|a|b|c|d)"\s*:/i.test(s)) return "";
+    const m = s.match(ERR_TEXT_RE);
+    if (!m) return "";
+    return s.slice(0, 240);
   }
 
   function extractContent(json) {
@@ -225,7 +261,13 @@
     return "";
   }
 
-  async function callModel(model, messages, timeout) {
+  async function callModel(model, messages, timeout, opts) {
+    opts = opts || {};
+    const ep = Math.max(0, Math.min(ENDPOINTS.length - 1, opts.ep || 0));
+    const url = ENDPOINTS[ep];
+    const headers = { "Content-Type": "application/json" };
+    if (opts.useKey !== false) headers["Authorization"] = "Bearer " + getApiKey();
+
     const body = {
       model: model,
       messages: messages,
@@ -233,26 +275,37 @@
       private: true,
       referrer: "onluyen-solver"
     };
-    const r = await gmRequest({
-      url: PROXY_URL,
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer " + POLL_KEY
-      },
-      data: JSON.stringify(body),
-      timeout: timeout || API_TIMEOUT
-    });
+
+    const r = await gmRequest({ url, headers, data: JSON.stringify(body), timeout: timeout || API_TIMEOUT });
 
     if (!r.ok) {
       const msg = String(r.text || r.err || "").slice(0, 300);
-      if (isPaidError(r.status, msg)) return { ok: false, paid: true, status: r.status, err: msg };
-      return { ok: false, paid: false, status: r.status, err: msg };
+      return { ok: false, paid: isPaidError(r.status, msg), status: r.status, err: msg };
     }
+
     let json = null;
     try { json = JSON.parse(r.text); }
-    catch (e) { return { ok: false, paid: false, status: r.status, err: "bad JSON" }; }
+    catch (e) {
+      const plain = String(r.text || "").trim();
+      const apiErr = detectApiErrorText(plain);
+      if (apiErr) return { ok: false, paid: PAID_TEXT_RE.test(apiErr), status: r.status, err: apiErr };
+      if (plain) return { ok: true, text: plain };
+      return { ok: false, paid: false, status: r.status, err: "bad JSON" };
+    }
+
+    if (json && json.error) {
+      const em = typeof json.error === "string" ? json.error : (json.error.message || JSON.stringify(json.error));
+      return { ok: false, paid: isPaidError(0, em), status: r.status, err: String(em).slice(0, 240) };
+    }
+
     const content = extractContent(json);
     if (!content) return { ok: false, paid: false, status: r.status, err: "empty content" };
+
+    const apiErr = detectApiErrorText(content);
+    if (apiErr) {
+      return { ok: false, paid: PAID_TEXT_RE.test(apiErr), status: r.status, err: apiErr };
+    }
+
     return { ok: true, text: content };
   }
 
@@ -263,67 +316,108 @@
 
   function buildChain(needVision) {
     const chosen = getModel();
-    const out = [];
+    let out = [];
     const push = (m) => {
       if (!m) return;
       if (out.indexOf(m) >= 0) return;
-      if (isPaid(m)) return;
       out.push(m);
     };
     push(chosen);
     push(getWorkingModel());
     FALLBACK_MODELS.forEach(push);
 
-    let list = out;
     if (needVision) {
-      list = out.filter(isVisionModel).concat(out.filter((m) => !isVisionModel(m)));
+      out = out.filter((m) => isVisionModel(m)).concat(out.filter((m) => !isVisionModel(m)));
     }
-    return list.slice(0, 5);
+    return out.slice(0, 6);
+  }
+
+  function buildAttempts(models) {
+    const out = [];
+    const seen = new Set();
+    const add = (m, ep, useKey) => {
+      if (!m) return;
+      if (useKey && isPaid(m)) return;
+      const k = m + "|" + ep + "|" + (useKey ? "k" : "a");
+      if (seen.has(k)) return;
+      seen.add(k);
+      out.push({ model: m, ep: ep, useKey: useKey });
+    };
+
+    const c = getWorkingCombo();
+    if (c && models.indexOf(c.model) >= 0) add(c.model, c.ep, c.useKey);
+
+    const preferKey = getUseKey();
+    if (preferKey) {
+      for (const m of models) add(m, 0, true);
+      for (const m of models) add(m, 0, false);
+      for (const m of models) add(m, 1, false);
+      for (const m of models) add(m, 1, true);
+    } else {
+      for (const m of models) add(m, 0, false);
+      for (const m of models) add(m, 0, true);
+      for (const m of models) add(m, 1, false);
+    }
+    return out.slice(0, 18);
+  }
+
+  function tagOf(a) {
+    return (a.useKey ? "key" : "anon") + "·ep" + a.ep;
+  }
+
+  async function runChain(models, messages, budget, perTimeout, visionOnly) {
+    const attempts = buildAttempts(models);
+    if (!attempts.length) return { ok: false, reason: "no-attempts" };
+    const start = Date.now();
+    let lastErr = "";
+    let sawPaid = false;
+
+    for (const a of attempts) {
+      const left = budget - (Date.now() - start);
+      if (left < 5000) break;
+      if (visionOnly && !isVisionModel(a.model)) continue;
+
+      const to = Math.min(perTimeout, left);
+      log("… " + a.model + " (" + tagOf(a) + ")");
+      const r = await callModel(a.model, messages, to, a);
+
+      if (r.ok) {
+        setWorkingModel(a.model);
+        setWorkingCombo({ model: a.model, ep: a.ep, useKey: a.useKey });
+        log((visionOnly ? "👁 Vision (" : "AI (") + a.model + " · " + tagOf(a) + ") OK");
+        return { ok: true, text: r.text, model: a.model, attempt: a };
+      }
+
+      if (r.paid) {
+        sawPaid = true;
+        if (a.useKey) { markPaid(a.model); log("💳 " + a.model + " cần trả phí (key) → bỏ model này."); }
+        else log("💳 " + a.model + " cần trả phí (anon).");
+        lastErr = r.err || "";
+        continue;
+      }
+
+      lastErr = r.err || ("status " + r.status);
+      log("✗ " + a.model + " (" + tagOf(a) + ") → " + String(lastErr).slice(0, 110));
+    }
+
+    return { ok: false, reason: sawPaid ? "all-paid" : "all-failed", err: lastErr };
   }
 
   async function askAI(messages, opts) {
     const budget = (opts && opts.budget) || ASK_BUDGET_MS;
     const chain = buildChain(false);
-    const start = Date.now();
-    if (!chain.length) { log("⚠ Không còn model nào (tất cả bị đánh dấu trả phí). Bấm 🌐 Model free."); return { ok: false }; }
-
-    for (const model of chain) {
-      const left = budget - (Date.now() - start);
-      if (left < 4000) break;
-      const to = Math.min(API_TIMEOUT, left);
-      log("… gọi " + model);
-      const r = await callModel(model, messages, to);
-      if (r.ok) {
-        setWorkingModel(model);
-        log("AI (" + model + ") OK");
-        return { ok: true, text: r.text, model: model };
-      }
-      if (r.paid) { markPaid(model); log("💳 " + model + " cần trả phí → bỏ, thử model khác."); continue; }
-      log("✗ " + model + " → " + String(r.err || ("status " + r.status)).slice(0, 120));
-    }
+    const r = await runChain(chain, messages, budget, API_TIMEOUT, false);
+    if (r.ok) return r;
+    if (r.reason === "all-paid") log("⚠ TẤT CẢ model đều báo hết credit. Cần nạp Pollen hoặc nhập API key khác.");
+    else if (r.reason === "all-failed") log("⚠ Tất cả model đều lỗi. Lỗi cuối: " + String(r.err || "").slice(0, 120));
     return { ok: false };
   }
 
   async function askAIVision(messages, opts) {
     const budget = (opts && opts.budget) || VISION_BUDGET_MS;
     const chain = buildChain(true);
-    const start = Date.now();
-
-    for (const model of chain) {
-      const left = budget - (Date.now() - start);
-      if (left < 5000) break;
-      if (!isVisionModel(model)) continue;
-      const to = Math.min(VISION_TIMEOUT, left);
-      log("… [vision] " + model);
-      const r = await callModel(model, messages, to);
-      if (r.ok) {
-        setWorkingModel(model);
-        log("👁 Vision (" + model + ") OK");
-        return { ok: true, text: r.text, model: model };
-      }
-      if (r.paid) { markPaid(model); log("💳 [vision] " + model + " cần trả phí → bỏ."); continue; }
-      log("✗ [vision] " + model + " → " + String(r.err || ("status " + r.status)).slice(0, 120));
-    }
+    const r = await runChain(chain, messages, budget, VISION_TIMEOUT, true);
+    if (r.ok) return r;
     return { ok: false };
   }
 
@@ -336,15 +430,18 @@
         const arr = JSON.parse(r.text);
         if (!Array.isArray(arr)) { log("✗ " + url + " không phải mảng"); continue; }
         const names = arr.map((m) => (typeof m === "string" ? m : m.name || m.id || "")).filter(Boolean);
-        const free = arr.filter((m) => typeof m === "object" && !m.paid_only && !m.paidOnly && m.tier !== "paid"
-          && !/paid/i.test(String(m.tier || "")));
-        const freeNames = free.map((m) => (typeof m === "string" ? m : m.name || m.id || "")).filter(Boolean);
+        const freeNames = arr
+          .filter((m) => typeof m !== "object" || (!m.paid_only && !m.paidOnly && m.tier !== "paid" && !/paid/i.test(String(m.tier || ""))))
+          .map((m) => (typeof m === "string" ? m : m.name || m.id || ""))
+          .filter(Boolean);
         log("📋 " + url + " → " + names.length + " model");
         log("FREE (" + freeNames.length + "): " + freeNames.slice(0, 60).join(", "));
         const paidNames = names.filter((n) => freeNames.indexOf(n) < 0);
         if (paidNames.length) log("PAID (" + paidNames.length + "): " + paidNames.slice(0, 40).join(", "));
-        const vm = free.filter((m) => typeof m === "object" && (m.vision === true || m.supports_vision === true)).map((m) => m.name || m.id);
-        if (vm.length) log("👁 Vision free: " + vm.join(", "));
+        const vm = arr
+          .filter((m) => typeof m === "object" && (m.vision === true || m.supports_vision === true))
+          .map((m) => m.name || m.id);
+        if (vm.length) log("👁 Vision: " + vm.join(", "));
         log("=== HẾT DANH SÁCH ===");
         return freeNames;
       } catch (e) {
@@ -387,7 +484,7 @@
 
   function parseAnswerObj(raw, labels) {
     if (!raw) return null;
-    let text = String(raw).trim().replace(/```[a-zA-Z]*\n?/g, "").trim();
+    const text = String(raw).trim().replace(/```[a-zA-Z]*\n?/g, "").trim();
 
     const mj = text.match(/\{[\s\S]*\}/);
     if (mj) {
@@ -448,6 +545,59 @@
 
     const parts = text.split(/[\n,;]+/).map((s) => s.replace(/^\s*\(?\d+[\.\)]\s*/, "").trim()).filter(Boolean);
     return parts.slice(0, n);
+  }
+
+  /* --------- ĐÚNG/SAI PARSER --------- */
+  function tfNorm(v) {
+    const s = String(v == null ? "" : v).trim().toLowerCase();
+    if (!s) return "";
+    if (/^(true|t|1|yes|y|correct)$/.test(s)) return "true";
+    if (/^(false|f|0|no|n|incorrect|wrong)$/.test(s)) return "false";
+    if (/^(đúng|dung|đ|d)$/.test(s)) return "true";
+    if (/^(sai|s)$/.test(s)) return "false";
+    if (/đúng|dung|correct|true/.test(s) && !/sai|false/.test(s)) return "true";
+    if (/sai|false|incorrect|wrong/.test(s)) return "false";
+    return "";
+  }
+
+  function parseTrueFalseAnswers(raw, keys) {
+    const out = {};
+    if (!raw) return out;
+    const text = String(raw).replace(/```[a-zA-Z]*\n?/g, "").trim();
+
+    const mj = text.match(/\{[\s\S]*\}/);
+    if (mj) {
+      try {
+        const o = JSON.parse(mj[0]);
+        for (const k of Object.keys(o)) {
+          let key = String(k).trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+          if (/^[1-9]$/.test(key)) key = String.fromCharCode(64 + parseInt(key, 10));
+          else key = key.replace(/[^A-Z]/g, "").slice(-1);
+          if (!key || keys.indexOf(key) < 0) continue;
+          const v = tfNorm(o[k]);
+          if (v) out[key] = v;
+        }
+        if (Object.keys(out).length) return out;
+      } catch (e) {}
+    }
+
+    for (const ln of text.split(/\n+/)) {
+      const m = ln.match(/^\s*[-*•]?\s*\(?([a-dA-D1-4])\)?\s*[\.\)\:\-–]?\s*(.+)$/);
+      if (!m) continue;
+      let key = m[1].toUpperCase();
+      if (/^[1-4]$/.test(key)) key = String.fromCharCode(64 + parseInt(key, 10));
+      if (keys.indexOf(key) < 0) continue;
+      const v = tfNorm(m[2]);
+      if (v) out[key] = v;
+    }
+    if (Object.keys(out).length) return out;
+
+    const parts = text.split(/[,;\n]+/).map((s) => s.trim()).filter(Boolean);
+    const vals = parts.map((p) => tfNorm(p.replace(/^[a-dA-D1-4][\.\)\:\-]\s*/, ""))).filter(Boolean);
+    if (vals.length === keys.length) {
+      keys.forEach((K, i) => { if (!out[K]) out[K] = vals[i]; });
+    }
+    return out;
   }
 
   /* ============================ DOM READ ============================ */
@@ -521,14 +671,12 @@
       }
     }
 
-    // Dedup + remove nested duplicates
     const uniq = [];
     for (const el of list) {
       if (!el || !el.isConnected) continue;
       if (uniq.some((u) => u === el || u.contains(el) || el.contains(u))) continue;
       uniq.push(el);
     }
-    // Re-check nesting: keep innermost among duplicates
     const finalList = uniq.filter((el) => !uniq.some((o) => o !== el && el.contains(o)));
 
     if (finalList.length < 2) return { list: [], type: "" };
@@ -547,8 +695,6 @@
     if (inp) {
       const v = (inp.value || "").trim();
       if (/^[A-Za-z]$/.test(v)) return v.toUpperCase();
-      const idm = (inp.id || "").match(/-(\d+)$/);
-      if (idm) { /* fall through */ }
     }
     const txt = (el.textContent || "").trim();
     const m2 = txt.match(/^([A-Za-z])[\.\)\:\s]/);
@@ -626,11 +772,6 @@
     return text.slice(0, 4500);
   }
 
-  function stemWithBlanks() {
-    const base = getStemText();
-    return base;
-  }
-
   function getTargetBlankNumber() {
     const root = qRoot();
     if (!root) return 0;
@@ -653,7 +794,6 @@
       const t = (el.getAttribute("type") || "").toLowerCase();
       if (t === "hidden" || t === "radio" || t === "checkbox" || t === "file") continue;
       if (!visible(el)) continue;
-      if (el.isContentEditable && el.tagName !== "DIV" && el.tagName !== "P") { /* keep */ }
       out.push(el);
     }
     return out;
@@ -678,8 +818,7 @@
     const out = [];
     for (const bar of bars) {
       if (insideGui(bar)) continue;
-      const btns = qsa("button, a.btn", bar);
-      for (const b of btns) {
+      for (const b of qsa("button, a.btn", bar)) {
         const t = (b.textContent || "").replace(/\s+/g, " ").trim();
         if (t) out.push(t);
       }
@@ -696,6 +835,130 @@
     const opts = qsa(".answer-sheet .option");
     if (opts.length && opts.every((o) => o.classList.contains("done"))) return true;
     return false;
+  }
+
+  /* ============================ ĐÚNG/SAI DETECT ============================ */
+  function labelTextFor(inp) {
+    if (!inp) return "";
+    if (inp.id) {
+      try {
+        const lab = document.querySelector('label[for="' + escSel(inp.id) + '"]');
+        if (lab) return (lab.textContent || "").trim();
+      } catch (e) {}
+    }
+    const p = inp.closest ? inp.closest("label") : null;
+    if (p) return (p.textContent || "").trim();
+    const sib = inp.nextElementSibling;
+    if (sib && sib.tagName === "LABEL") return (sib.textContent || "").trim();
+    return "";
+  }
+
+  function classifyTF(inp) {
+    if (!inp) return "";
+    const v = String(inp.value || "").trim().toLowerCase();
+    if (/^(true|t|1|yes|y)$/.test(v)) return "true";
+    if (/^(false|f|0|no|n)$/.test(v)) return "false";
+    if (v === "đ" || v === "d") return "true";
+    if (v === "s") return "false";
+
+    const l = labelTextFor(inp).toLowerCase();
+    if (/^\s*(đúng|dung|true|correct|đ)\b/.test(l)) return "true";
+    if (/^\s*(sai|false|incorrect|wrong)\b/.test(l)) return "false";
+    return "";
+  }
+
+  function buildTFGroup(block, t, f, holder) {
+    let text = "";
+    let label = "";
+
+    if (holder) {
+      const ot = qs(".option-text", holder) || qs(".statement-text", holder) || qs(".child-text", holder);
+      if (ot) {
+        const clone = ot.cloneNode(true);
+        const oc = clone.querySelector(".option-char");
+        if (oc) {
+          const m = (oc.textContent || "").match(/([A-Za-zĐđ])/);
+          if (m) label = m[1].toUpperCase();
+          oc.remove();
+        }
+        text = (clone.textContent || "").replace(/\s+/g, " ").trim();
+      }
+      if (!text) {
+        try {
+          const clone = holder.cloneNode(true);
+          clone.querySelectorAll('.true-false, [class*="true-false"], [class*="truefalse"], [class*="true_false"], input, label, .option-char')
+            .forEach((e) => e.remove());
+          text = (clone.textContent || "").replace(/\s+/g, " ").trim();
+        } catch (e) {}
+      }
+      if (!text) {
+        const prev = holder.previousElementSibling;
+        if (prev) text = (prev.textContent || "").replace(/\s+/g, " ").trim().slice(0, 600);
+      }
+    }
+
+    if (!label) {
+      // thử tìm trong khối block
+      const oc = qs(".option-char", block);
+      if (oc) {
+        const m = (oc.textContent || "").match(/([A-Za-zĐđ])/);
+        if (m) label = m[1].toUpperCase();
+      }
+    }
+
+    return { block: block, trueRadio: t, falseRadio: f, holder: holder, text: text, label: label };
+  }
+
+  function getTrueFalseGroups() {
+    const root = qRoot() || document;
+    const out = [];
+
+    const addGroup = (block, t, f) => {
+      if (!t || !f) return;
+      if (out.some((g) => g.trueRadio === t && g.falseRadio === f)) return;
+      const holder = (block.closest && (block.closest(".child-content") || block.closest(".question-child")
+        || block.closest("tr") || block.closest('[class*="statement"]') || block.closest('[class*="item"]')))
+        || block.parentElement;
+      const g = buildTFGroup(block, t, f, holder);
+      if (g) out.push(g);
+    };
+
+    // 1) khối .true-false
+    const blocks = qsa('.true-false, [class*="true-false"], [class*="truefalse"], [class*="true_false"]', root);
+    for (const b of blocks) {
+      if (insideGui(b)) continue;
+      const inputs = qsa('input[type="radio"], input[type="checkbox"]', b).filter((r) => !r.disabled);
+      if (inputs.length < 2) continue;
+      let t = null, f = null;
+      for (const inp of inputs) {
+        const k = classifyTF(inp);
+        if (k === "true" && !t) t = inp;
+        else if (k === "false" && !f) f = inp;
+      }
+      if (t && f) addGroup(b, t, f);
+    }
+    if (out.length) return out;
+
+    // 2) fallback: nhóm radio theo holder
+    const radios = qsa('input[type="radio"]', root).filter((r) => !r.disabled && !insideGui(r));
+    const map = new Map();
+    for (const r of radios) {
+      const k = classifyTF(r);
+      if (!k) continue;
+      const h = (r.closest && (r.closest(".child-content") || r.closest(".question-child")
+        || r.closest("tr") || r.closest('[class*="statement"]')))
+        || (r.parentElement && r.parentElement.parentElement) || r.parentElement;
+      if (!h) continue;
+      if (!map.has(h)) map.set(h, { t: null, f: null });
+      const slot = map.get(h);
+      if (k === "true" && !slot.t) slot.t = r;
+      if (k === "false" && !slot.f) slot.f = r;
+    }
+    for (const [h, slot] of map) {
+      if (slot.t && slot.f) addGroup(h, slot.t, slot.f);
+    }
+
+    return out;
   }
 
   /* ============================ ACTIONS ============================ */
@@ -761,6 +1024,42 @@
       if (isSelected(opt)) return true;
     }
     return isSelected(opt);
+  }
+
+  async function applyTrueFalse(group, value) {
+    if (!group) return false;
+    const target = value === "true" ? group.trueRadio : group.falseRadio;
+    if (!target) return false;
+    if (target.checked) return true;
+
+    try { target.scrollIntoView({ block: "center" }); } catch (e) {}
+    await sleep(80);
+
+    let label = null;
+    if (target.id) {
+      try { label = document.querySelector('label[for="' + escSel(target.id) + '"]'); } catch (e) {}
+    }
+    if (!label && target.nextElementSibling && target.nextElementSibling.tagName === "LABEL") {
+      label = target.nextElementSibling;
+    }
+    if (label) {
+      singleClick(label);
+      await sleep(200);
+      if (target.checked) return true;
+    }
+
+    singleClick(target);
+    await sleep(200);
+    if (target.checked) return true;
+
+    try {
+      target.checked = true;
+      target.dispatchEvent(new Event("input", { bubbles: true }));
+      target.dispatchEvent(new Event("change", { bubbles: true }));
+      target.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    } catch (e) {}
+    await sleep(160);
+    return target.checked;
   }
 
   function nativeSet(el, val) {
@@ -927,6 +1226,22 @@
     ];
   }
 
+  function buildTrueFalseMessages(stem, items, prev) {
+    const lines = items.map((it) => "(" + it.key + ") " + (it.text || "(trống)")).join("\n");
+    const example = items.map((it) => '"' + it.key + '":"Đúng"').join(",");
+    let user = "ĐỀ BÀI:\n" + stem + "\n\nCÁC Ý CẦN ĐÁNH GIÁ ĐÚNG/SAI:\n" + lines + "\n\n";
+    user += "Với MỖI ý ở trên, hãy đánh giá là ĐÚNG hay SAI.\n";
+    user += "Trả lời DUY NHẤT bằng JSON (đủ " + items.length + " khóa): {" + example + "}";
+    if (prev) {
+      const prevStr = items.map((it) => it.key + "=" + (prev[it.key] === "true" ? "Đúng" : prev[it.key] === "false" ? "Sai" : "?")).join(", ");
+      user += "\nLần trước bạn đã trả lời: " + prevStr + ". Kiểm tra lại thật kỹ từng ý, giữ nguyên nếu đúng, sửa nếu sai.";
+    }
+    return [
+      { role: "system", content: "Bạn là giáo viên giỏi, đánh giá đúng/sai chính xác, chỉ trả về JSON." },
+      { role: "user", content: user }
+    ];
+  }
+
   function buildFillMessages(stem, count, targetBlank) {
     let user = "";
     if (targetBlank) user += "Chỉ cần trả lời cho CHỖ TRỐNG SỐ (" + targetBlank + ") trong đoạn văn.\n\n";
@@ -1014,6 +1329,20 @@
     return null;
   }
 
+  async function solveTrueFalse(stem, items, prev) {
+    const msgs = buildTrueFalseMessages(stem, items, prev);
+    const r = await askAI(msgs, { budget: ASK_BUDGET_MS });
+    if (!r.ok) return null;
+    const keys = items.map((it) => it.key);
+    const p = parseTrueFalseAnswers(r.text, keys);
+    if (Object.keys(p).length) {
+      log("AI đánh giá: " + items.map((it) => it.key + "=" + (p[it.key] === "true" ? "Đ" : p[it.key] === "false" ? "S" : "?")).join(" "));
+      return p;
+    }
+    log("⚠ Không đọc được trả lời đúng/sai: " + r.text.slice(0, 180));
+    return null;
+  }
+
   async function stepMcq(opts, token) {
     const sig = sigNow();
     const title = currentQuestionTitle();
@@ -1042,9 +1371,8 @@
     if (token !== genToken) return;
     if (!first) { log("⚠ Không có đáp án — chuyển câu."); await advance(); return; }
 
-    let chosenLabel = first.letter;
-    let target = items.find((o) => o.label === chosenLabel);
-    if (!target) { log("⚠ Đáp án AI trả về không khớp lựa chọn (" + chosenLabel + ") — chuyển câu."); await advance(); return; }
+    let target = items.find((o) => o.label === first.letter);
+    if (!target) { log("⚠ Đáp án AI trả về không khớp lựa chọn (" + first.letter + ") — chuyển câu."); await advance(); return; }
 
     log("AI chọn " + target.label + (target.text ? ". " + target.text.slice(0, 70) : ". (hình ảnh)") +
       (first.reason ? ' · "' + first.reason.slice(0, 110) + '"' : ""));
@@ -1054,7 +1382,6 @@
     if (token !== genToken) return;
     log(ok ? "Đã tick " + target.label + "." : "⚠ Không tick được " + target.label + ".");
 
-    // ---- verify passes ----
     const times = getVerifyTimes();
     for (let i = 0; i < times; i++) {
       if (token !== genToken) return;
@@ -1068,11 +1395,74 @@
       if (!alt) { log("… Kiểm tra " + (i + 1) + ": AI đổi sang " + again.letter + " nhưng không khớp — bỏ qua."); continue; }
       log("↻ Kiểm tra " + (i + 1) + " đổi sang " + alt.label + " · " + (again.reason || "").slice(0, 100));
       const ok2 = await applyAnswer(alt.el);
-      if (ok2) { target = alt; chosenLabel = alt.label; showAnswer(alt.label + ". " + (alt.text || "(hình ảnh)")); }
+      if (ok2) { target = alt; showAnswer(alt.label + ". " + (alt.text || "(hình ảnh)")); }
     }
 
-    if (getRedo() && sig !== sigNow()) { /* nothing */ }
+    await advance();
+  }
 
+  async function stepTrueFalse(groups, token) {
+    const sig = sigNow();
+    log("Tìm thấy " + groups.length + " ý Đúng/Sai | " + currentQuestionTitle());
+
+    let stem = getStemText();
+    const root = qRoot();
+    if (root) {
+      const ts = qs(".title-static", root);
+      if (ts) {
+        const t = (ts.textContent || "").replace(/\s+/g, " ").trim();
+        if (t && stem.indexOf(t) < 0) stem = t + "\n\n" + stem;
+      }
+    }
+
+    const items = groups.map((g, i) => ({
+      key: g.label || String.fromCharCode(65 + i),
+      text: g.text || "",
+      group: g
+    }));
+
+    log("Ý: " + items.map((it) => it.key + "=" + (it.text || "(trống)").slice(0, 40)).join(" | "));
+
+    const first = await solveTrueFalse(stem, items, null);
+    if (token !== genToken) return;
+    if (!first) { log("⚠ AI không trả lời được — chuyển câu."); await advance(); return; }
+
+    const current = {};
+    for (const it of items) {
+      const v = first[it.key];
+      if (!v) { log("⚠ AI thiếu ý " + it.key); continue; }
+      const ok = await applyTrueFalse(it.group, v);
+      log((ok ? "Đã chọn " : "⚠ Không chọn được ") + it.key + " = " + (v === "true" ? "Đúng" : "Sai"));
+      if (ok) current[it.key] = v;
+    }
+
+    const fmt = (m) => items.map((it) => it.key + ":" + (m[it.key] === "true" ? "Đ" : m[it.key] === "false" ? "S" : "?")).join(" ");
+    showAnswer(fmt(current));
+
+    if (Object.keys(current).length === 0) { log("⚠ Không chọn được ý nào — chuyển câu."); await advance(); return; }
+
+    const times = getVerifyTimes();
+    for (let i = 0; i < times; i++) {
+      if (token !== genToken) return;
+      const again = await solveTrueFalse(stem, items, current);
+      if (!again) { log("… Kiểm tra " + (i + 1) + ": AI không trả lời — bỏ qua."); continue; }
+      let changed = 0;
+      for (const it of items) {
+        const v = again[it.key];
+        if (!v) continue;
+        if (current[it.key] === v) continue;
+        const ok = await applyTrueFalse(it.group, v);
+        if (ok) {
+          current[it.key] = v;
+          changed++;
+          log("↻ Sửa " + it.key + " → " + (v === "true" ? "Đúng" : "Sai"));
+        }
+      }
+      log("✓ Kiểm tra " + (i + 1) + (changed ? " (đổi " + changed + " ý)" : " giữ nguyên"));
+      showAnswer(fmt(current));
+    }
+
+    await sleep(200);
     await advance();
   }
 
@@ -1081,7 +1471,7 @@
     const title = currentQuestionTitle();
     log("Tìm thấy " + inputs.length + " ô điền | " + title);
 
-    const stem = stemWithBlanks();
+    const stem = getStemText();
     const blankN = getTargetBlankNumber();
     const msgs = buildFillMessages(stem, inputs.length, blankN);
     const r = await askAI(msgs, { budget: ASK_BUDGET_MS });
@@ -1142,8 +1532,17 @@
       return;
     }
 
+    const tfGroups = getTrueFalseGroups();
     const opts = getOptions();
+
+    if (tfGroups.length >= 2 || (tfGroups.length >= 1 && opts.type === "raw-radio")) {
+      await stepTrueFalse(tfGroups, token);
+      return;
+    }
+
     if (opts.list.length >= 2) { await stepMcq(opts, token); return; }
+
+    if (tfGroups.length === 1) { await stepTrueFalse(tfGroups, token); return; }
 
     const fills = getFillInputs();
     if (fills.length) { await stepFill(fills, token); return; }
@@ -1171,7 +1570,8 @@
     setStatus("Đang chạy · " + getModel());
     log("=== START · chọn: " + getModel() + " · dùng: " + (getWorkingModel() || "—") + " ===");
     log("Model bị đánh dấu trả phí: " + (Array.from(getPaidSet()).join(", ") || "(không)"));
-    log("Vision: " + (getVisionEnabled() ? "ON" : "OFF") + " · Kiểm tra lại: " + getVerifyTimes() + " · Chu kỳ: " + getInterval() + "ms");
+    log("Key: " + (getUseKey() ? "ON" : "OFF (anon)") + " · Vision: " + (getVisionEnabled() ? "ON" : "OFF") +
+      " · Kiểm tra lại: " + getVerifyTimes() + " · Chu kỳ: " + getInterval() + "ms");
 
     while (running && token === genToken) {
       let timedOut = false;
@@ -1230,6 +1630,13 @@
     log("Tiêu đề câu: " + (currentQuestionTitle() || "(trống)"));
     logSubmitBar();
 
+    const tf = getTrueFalseGroups();
+    log("Đúng/Sai: " + tf.length + " ý");
+    tf.forEach((g, i) => {
+      log("  " + (g.label || String.fromCharCode(65 + i)) + ". " + (g.text || "(trống)").slice(0, 80) +
+        " [true=" + (g.trueRadio.id || "?") + " false=" + (g.falseRadio.id || "?") + "]");
+    });
+
     const opts = getOptions();
     log("Options: " + opts.list.length + (opts.type ? " (type=" + opts.type + ")" : ""));
     opts.list.forEach((el, i) => {
@@ -1259,17 +1666,22 @@
     log("Model chọn: " + getModel());
     log("Model đang dùng: " + (getWorkingModel() || "(chưa)"));
     log("Bị đánh dấu trả phí: " + (Array.from(getPaidSet()).join(", ") || "(không)"));
+    log("Dùng key: " + (getUseKey() ? "ON" : "OFF (anon)"));
 
     const msgs = [{ role: "user", content: 'Trả lời DUY NHẤT bằng JSON: {"answer":"B","reason":"test"}' }];
-    const chain = buildChain(false);
-    log("Chuỗi thử: " + chain.join(" → "));
 
-    for (const m of chain) {
-      log("… " + m);
-      const r = await callModel(m, msgs, 25000);
-      if (r.ok) log("✅ " + m + " OK → " + r.text.slice(0, 100));
-      else if (r.paid) { markPaid(m); log("💳 " + m + " CẦN TRẢ PHÍ → đã đánh dấu bỏ qua."); }
-      else log("✗ " + m + " → " + String(r.err || ("status " + r.status)).slice(0, 120));
+    const probe = ["openai-fast", "openai", "mistral", "gemini", "qwen-coder", "nova-fast"]
+      .filter((v, i, a) => a.indexOf(v) === i);
+
+    for (const m of probe) {
+      for (const mode of [{ useKey: true, ep: 0 }, { useKey: false, ep: 0 }]) {
+        const tag = (mode.useKey ? "key" : "anon") + "·ep" + mode.ep;
+        log("… " + m + " (" + tag + ")");
+        const r = await callModel(m, msgs, 20000, mode);
+        if (r.ok) log("✅ " + m + " (" + tag + ") OK → " + r.text.slice(0, 90));
+        else if (r.paid) log("💳 " + m + " (" + tag + ") CẦN TRẢ PHÍ.");
+        else log("✗ " + m + " (" + tag + ") → " + String(r.err || ("status " + r.status)).slice(0, 110));
+      }
     }
 
     log("=== TEST VISION ===");
@@ -1281,13 +1693,15 @@
         { type: "image_url", image_url: { url: tiny } }
       ]
     }];
-    for (const m of chain) {
-      if (!isVisionModel(m)) continue;
-      log("… [vision] " + m);
-      const r = await callModel(m, vmsgs, 30000);
-      if (r.ok) log("✅ vision " + m + " OK → " + r.text.slice(0, 100));
-      else if (r.paid) { markPaid(m); log("💳 vision " + m + " CẦN TRẢ PHÍ."); }
-      else log("✗ vision " + m + " → " + String(r.err || ("status " + r.status)).slice(0, 120));
+    for (const m of ["gemini", "openai", "openai-fast", "mistral"]) {
+      for (const mode of [{ useKey: true, ep: 0 }, { useKey: false, ep: 0 }]) {
+        const tag = (mode.useKey ? "key" : "anon") + "·ep" + mode.ep;
+        log("… [vision] " + m + " (" + tag + ")");
+        const r = await callModel(m, vmsgs, 25000, mode);
+        if (r.ok) log("✅ vision " + m + " (" + tag + ") OK → " + r.text.slice(0, 90));
+        else if (r.paid) log("💳 vision " + m + " (" + tag + ") CẦN TRẢ PHÍ.");
+        else log("✗ vision " + m + " (" + tag + ") → " + String(r.err || ("status " + r.status)).slice(0, 110));
+      }
     }
     log("=== HẾT TEST ===");
   }
@@ -1308,7 +1722,7 @@
 
     wrap.innerHTML =
       '<div id="ais-head" style="display:flex;align-items:center;gap:8px;padding:8px 10px;background:linear-gradient(90deg,#134e2a,#1b7a3e);font-weight:700;cursor:move;user-select:none;">' +
-        '<span>⚡ ai slover v39.9</span><span style="flex:1"></span>' +
+        '<span>⚡ ai slover v40.1</span><span style="flex:1"></span>' +
         '<button id="ais-collapse" style="background:#0b2b17;color:#cfe8d5;border:1px solid #2e7d32;border-radius:5px;padding:0 7px;cursor:pointer;">–</button>' +
       '</div>' +
       '<div id="ais-body" style="padding:8px 10px 10px;">' +
@@ -1322,6 +1736,14 @@
           '<span style="width:78px;color:#9fb3c8;">Model khác</span>' +
           '<input id="ais-custom" placeholder="vd: openai-fast" style="flex:1;background:#151b22;color:#e8eaed;border:1px solid #2b3a47;border-radius:5px;padding:3px 5px;">' +
         '</div>' +
+
+        '<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">' +
+          '<span style="width:78px;color:#9fb3c8;">API key</span>' +
+          '<input id="ais-key" placeholder="(mặc định)" style="flex:1;background:#151b22;color:#e8eaed;border:1px solid #2b3a47;border-radius:5px;padding:3px 5px;">' +
+          '<button id="ais-keyreset" style="background:#3a3a3a;color:#ddd;border:0;border-radius:5px;padding:3px 6px;cursor:pointer;">↺</button>' +
+        '</div>' +
+
+        '<label style="display:flex;gap:6px;align-items:center;margin-bottom:4px;cursor:pointer;"><input id="ais-usekey" type="checkbox"> Dùng API key (tắt = chế độ ẩn danh free)</label>' +
 
         '<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">' +
           '<span style="width:78px;color:#9fb3c8;">Chu kỳ ms</span>' +
@@ -1354,12 +1776,11 @@
         '<div id="ais-status" style="color:#9fb3c8;margin-bottom:4px;">Sẵn sàng</div>' +
         '<div id="ais-answer" style="background:#0b2b17;border:1px solid #2e7d32;border-radius:6px;padding:5px 7px;color:#8bf0a8;font-weight:700;margin-bottom:6px;min-height:16px;"></div>' +
         '<div id="ais-log" style="height:172px;overflow:auto;background:#080b0e;border:1px solid #1e2a33;border-radius:6px;padding:5px;font:11px/1.35 ui-monospace,Consolas,monospace;color:#b8c7d1;"></div>' +
-        '<div style="margin-top:6px;color:#5f7284;font-size:10.5px;">v39.9 · model FREE (gemini) · vision · blank-numbered · chống treo 60s</div>' +
+        '<div style="margin-top:6px;color:#5f7284;font-size:10.5px;">v40.1 · Đúng/Sai · Vision · model free fallback · chống treo 150s</div>' +
       '</div>';
 
     document.body.appendChild(wrap);
 
-    // flush buffered logs
     const logEl = document.getElementById("ais-log");
     for (const line of logBuf.slice(-200)) {
       const d = document.createElement("div");
@@ -1368,7 +1789,6 @@
     }
     logEl.scrollTop = logEl.scrollHeight;
 
-    // ---- fill values ----
     const sel = document.getElementById("ais-model");
     const cur = getModel();
     const choices = MODEL_CHOICES.slice();
@@ -1377,13 +1797,14 @@
     sel.value = cur;
 
     document.getElementById("ais-custom").value = lsGet(MODEL_CUSTOM_KEY, "") || "";
+    document.getElementById("ais-key").value = lsGet(APIKEY_KEY, "") || "";
     document.getElementById("ais-interval").value = getInterval();
     document.getElementById("ais-verify").value = getVerifyTimes();
+    document.getElementById("ais-usekey").checked = getUseKey();
     document.getElementById("ais-vision").checked = getVisionEnabled();
     document.getElementById("ais-redo").checked = getRedo();
     document.getElementById("ais-autosubmit").checked = getAutoSubmit();
 
-    // ---- events ----
     sel.addEventListener("change", () => {
       lsSet(MODEL_KEY, sel.value);
       lsSet(MODEL_CUSTOM_KEY, "");
@@ -1395,6 +1816,23 @@
       const v = (e.target.value || "").trim();
       lsSet(MODEL_CUSTOM_KEY, v);
       log(v ? "Model khác → " + v : "Bỏ model khác.");
+    });
+
+    document.getElementById("ais-key").addEventListener("change", (e) => {
+      const v = (e.target.value || "").trim();
+      lsSet(APIKEY_KEY, v);
+      log(v ? "Đã lưu API key riêng (" + v.slice(0, 8) + "…)." : "Dùng lại API key mặc định.");
+    });
+
+    document.getElementById("ais-keyreset").addEventListener("click", () => {
+      lsSet(APIKEY_KEY, "");
+      document.getElementById("ais-key").value = "";
+      log("↺ Đã khôi phục API key mặc định.");
+    });
+
+    document.getElementById("ais-usekey").addEventListener("change", (e) => {
+      lsSet(USEKEY_KEY, e.target.checked ? "1" : "0");
+      log("API key: " + (e.target.checked ? "ON" : "OFF (anon)"));
     });
 
     document.getElementById("ais-interval").addEventListener("change", (e) => {
@@ -1419,10 +1857,10 @@
     document.getElementById("ais-dump").addEventListener("click", dumpHTML);
     document.getElementById("ais-clearpaid").addEventListener("click", () => {
       clearPaid();
-      log("♻ Đã xoá danh sách model trả phí.");
+      lsSet(COMBO_KEY, "");
+      log("♻ Đã xoá danh sách model trả phí + combo đã lưu.");
     });
 
-    // ---- collapse ----
     document.getElementById("ais-collapse").addEventListener("click", () => {
       const body = document.getElementById("ais-body");
       const hidden = body.style.display === "none";
@@ -1430,7 +1868,6 @@
       document.getElementById("ais-collapse").textContent = hidden ? "–" : "+";
     });
 
-    // ---- drag ----
     const head = document.getElementById("ais-head");
     let drag = false, dx = 0, dy = 0;
     head.addEventListener("pointerdown", (e) => {
@@ -1463,6 +1900,7 @@
     log("URL: " + location.href);
     log("qRoot: " + (qRoot() ? "có container" : "chưa thấy (trang đang tải)"));
     log("Model mặc định: " + DEFAULT_MODEL + " · đang chọn: " + getModel());
+    log("API key: " + (getUseKey() ? "ON" : "OFF (anon)"));
     if (getPaidSet().size) log("⚠ Model bị đánh dấu trả phí: " + Array.from(getPaidSet()).join(", ") + " (bấm ♻ để xoá)");
   }
 
@@ -1472,7 +1910,6 @@
     boot();
   }
 
-  // expose for debugging
   window.__AI_SOLVER__ = {
     start: start,
     stop: stop,
