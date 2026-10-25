@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         AI Solver v39.7
+// @name         AI Solver v39.8
 // @namespace    https://onluyen.vn/
-// @version      39.7.0
-// @description  Auto solve onluyen.vn - MCQ + select-item + fill + essay + diagnostics
+// @version      39.8.0
+// @description  Auto solve onluyen.vn + vision cho đáp án là hình ảnh
 // @match        https://*.onluyen.vn/*
 // @match        https://onluyen.vn/*
 // @grant        GM_xmlhttpRequest
@@ -19,7 +19,7 @@
   "use strict";
 
   /* ================= CONFIG ================= */
-  const VERSION_STR = "39.7.0";
+  const VERSION_STR = "39.8.0";
   const GUI_ID      = "ai-solver-v38";
   const PROXY_URL   = "https://gen.pollinations.ai/v1/chat/completions";
   const POLL_KEY    = "sk_D8PP0K4jFUDUa0zjrx7uxq1XM1ZoVINK";
@@ -31,15 +31,21 @@
   const VERIFY_KEY       = "HW_SOLVER_VERIFY";
   const AUTOSUBMIT_KEY   = "HW_SOLVER_AUTO_SUBMIT";
   const REDO_KEY         = "HW_SOLVER_REDO_DONE";
+  const VISION_KEY       = "HW_SOLVER_VISION";
 
-  const DEFAULT_MODEL  = "deepseek/deepseek-v4-flash";
+  const DEFAULT_MODEL   = "deepseek/deepseek-v4-flash";
   const FALLBACK_MODELS = ["deepseek", "openai", "openai-fast", "gemini"];
-  const MODEL_CHOICES  = ["deepseek/deepseek-v4-flash", "deepseek", "gemini", "openai", "claude"];
+  const MODEL_CHOICES   = ["deepseek/deepseek-v4-flash", "deepseek", "gemini", "openai", "claude"];
 
-  const MAX_OPTIONS   = 12;
-  const API_TIMEOUT   = 35000;
-  const WATCHDOG_MS   = 60000;
-  const ASK_BUDGET_MS = 110000;
+  const VISION_MODELS  = ["gemini", "openai-large", "openai", "openai-fast"];
+
+  const MAX_OPTIONS        = 12;
+  const API_TIMEOUT        = 35000;
+  const VISION_TIMEOUT     = 45000;
+  const ASK_BUDGET_MS      = 110000;
+  const VISION_BUDGET_MS   = 120000;
+  const WATCHDOG_MS        = 60000;
+  const MAX_VISION_BYTES   = 4000000;
 
   const BAD_BTN_RE    = /(bỏ qua|skip|nộp bài|nộp|xác nhận nộp|hủy|huỷ|cancel|thoát|đóng|close|báo lỗi)/i;
   const NEXT_RE       = /(câu tiếp|câu sau|tiếp theo|câu kế|kế tiếp|next)/i;
@@ -55,7 +61,7 @@
     answered: 0,
   };
 
-  const beat = () => { state.lastBeat = Date.now(); };
+  const beat  = () => { state.lastBeat = Date.now(); };
   const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms | 0)));
   const alive = (myGen) => state.running && myGen === state.gen;
 
@@ -70,10 +76,9 @@
     const d = document.createElement("div");
     d.textContent = line;
     logEl.appendChild(d);
-    while (logEl.childNodes.length > 200) logEl.removeChild(logEl.firstChild);
+    while (logEl.childNodes.length > 220) logEl.removeChild(logEl.firstChild);
     logEl.scrollTop = logEl.scrollHeight;
   }
-
   function setStatus(s) { if (statusEl) statusEl.textContent = s; }
   function showAnswer(s) { if (answerEl) answerEl.textContent = s || "—"; }
 
@@ -88,7 +93,6 @@
     if (!el.getClientRects().length) return false;
     const st = getComputedStyle(el);
     if (st.display === "none" || st.visibility === "hidden") return false;
-    // radio/checkbox .form-check-input often has opacity:0 but is still clickable
     const isCheck = el.tagName === "INPUT" && (el.type === "radio" || el.type === "checkbox");
     if (!isCheck && st.opacity === "0") return false;
     return true;
@@ -113,18 +117,16 @@
     return tries.map((s) => s + "=" + ($(s) ? "✓" : "✗")).join(" ");
   }
 
-  // ---- MULTI-STRATEGY OPTION DETECTION ----
+  // ---- OPTIONS ----
   function getOptions() {
     const root = qRoot();
     if (!root) return [];
     const ex = (el) => !insideGui(el) && !el.closest(".answer-sheet") && isVisible(el);
     const sizeOk = (a) => a.length >= 2 && a.length <= MAX_OPTIONS;
 
-    // Strategy 1: classic MCQ (template-23)
     let opts = $$("div.question-option", root).filter(ex);
     if (sizeOk(opts)) return opts.slice(0, MAX_OPTIONS);
 
-    // Strategy 2: template-24 "Blank numbered" — .select-item wrapping a radio
     opts = $$(".select-item", root).filter((el) =>
       !insideGui(el) && !el.closest(".answer-sheet") && isVisible(el) &&
       el.querySelector('input[type="radio"], input[type="checkbox"]')
@@ -134,7 +136,6 @@
       return opts;
     }
 
-    // Strategy 3: generic class variants
     const classSels = [
       '[class*="question-option"]','[class*="answer-option"]',
       '[class*="choice-item"]','[class*="option-item"]',
@@ -151,7 +152,6 @@
       }
     }
 
-    // Strategy 4: label wrapping radio/checkbox
     opts = $$("label", root).filter((l) =>
       l.querySelector('input[type="radio"], input[type="checkbox"]') && ex(l)
     );
@@ -160,7 +160,6 @@
       return opts;
     }
 
-    // Strategy 5: raw radios, wrap with nearest container
     const rad = $$('input[type="radio"], input[type="checkbox"]', root).filter((i) =>
       !insideGui(i) && !i.closest(".answer-sheet") && !isNoteArea(i) &&
       i.getClientRects().length > 0
@@ -198,11 +197,9 @@
   function getStemText() {
     const host = $("#test-step-question .question-name") || $(".question-name");
     const ctx  = $("#test-step-question .question-text") || $(".question-text");
-
     let a = "";
     if (host) {
       const clone = host.cloneNode(true);
-      // Remove options list from title to avoid duplicating in prompt
       const sel = clone.querySelector(".list-selection");
       if (sel && sel.parentNode) sel.parentNode.removeChild(sel);
       a = (clone.innerText || clone.textContent || "");
@@ -232,24 +229,57 @@
     return (clone.innerText || clone.textContent || "").replace(/\s+/g, " ").trim().slice(0, 4000);
   }
 
+  // ---- IMAGES ----
+  function isImageSrc(src) {
+    if (!src) return false;
+    return /^data:image\//i.test(src) || /^https?:\/\//i.test(src);
+  }
+
+  function optionImageUrl(opt) {
+    if (!opt) return "";
+    const c = opt.querySelector(".question-option-content") || opt;
+    const imgs = Array.from(c.querySelectorAll("img"));
+    for (let i = 0; i < imgs.length; i++) {
+      const src = imgs[i].getAttribute("src") || imgs[i].src || "";
+      if (isImageSrc(src)) return src;
+    }
+    return "";
+  }
+
+  function stemImages() {
+    const hosts = [];
+    const qn = $("#test-step-question .question-name");
+    const qt = $("#test-step-question .question-text");
+    if (qn) hosts.push(qn);
+    if (qt) hosts.push(qt);
+    const out = [];
+    const seen = {};
+    hosts.forEach((h) => {
+      h.querySelectorAll("img").forEach((im) => {
+        const src = im.getAttribute("src") || im.src || "";
+        if (isImageSrc(src) && !seen[src]) { seen[src] = 1; out.push(src); }
+      });
+    });
+    return out;
+  }
+
   function optionLabel(opt) {
     const l = $(".question-option-label", opt);
     if (l) return (l.textContent || "").trim().toUpperCase();
-    // template-24: span.number-item
     const n = $(".number-item", opt);
     if (n) return (n.textContent || "").trim().toUpperCase();
-    // leading letter in text "A. ..."
     const t = (opt.textContent || "").trim();
     const m = t.match(/^([A-Da-d])[\.\)\:]\s*/);
     return m ? m[1].toUpperCase() : "";
   }
   function optionText(opt) {
     const c = $(".question-option-content", opt);
-    if (c) return (c.innerText || c.textContent || "").trim();
-    // template-24: <label for=...>text</label>
+    if (c) {
+      const t = (c.innerText || c.textContent || "").trim();
+      if (t) return t;
+    }
     const lb = opt.querySelector("label");
     if (lb && (lb.textContent || "").trim()) return (lb.textContent || "").trim();
-    // generic fallback
     const t = (opt.textContent || "").trim();
     return t.replace(/^[A-Da-d][\.\)\:]\s*/, "").trim();
   }
@@ -279,6 +309,14 @@
       if (j.error) return "";
       const c = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
       if (typeof c === "string" && c.trim()) return c.trim();
+      if (Array.isArray(c)) {
+        const joined = c.map((p) => {
+          if (typeof p === "string") return p;
+          if (p && typeof p.text === "string") return p.text;
+          return "";
+        }).filter(Boolean).join("\n").trim();
+        if (joined) return joined;
+      }
       return "";
     }
     if (typeof text === "string" && text.trim() && text.trim()[0] !== "{") return text.trim();
@@ -288,7 +326,10 @@
   function extractError(text) {
     try {
       const j = JSON.parse(text);
-      if (j && j.error) return String(j.error).slice(0, 140);
+      if (j && j.error) {
+        if (typeof j.error === "string") return j.error.slice(0, 160);
+        return JSON.stringify(j.error).slice(0, 160);
+      }
     } catch (e) {}
     return "";
   }
@@ -302,9 +343,7 @@
       return { ok: res.ok, status: res.status, text: text };
     } catch (e) {
       return { ok: false, error: "fetch:" + (e && e.message ? e.message : e) };
-    } finally {
-      clearTimeout(t);
-    }
+    } finally { clearTimeout(t); }
   }
 
   function gmRequest(url, body, ms) {
@@ -320,7 +359,7 @@
           headers: {
             "Content-Type": "application/json",
             "Authorization": "Bearer " + POLL_KEY,
-            "Accept": "application/json"
+            "Accept": "application/json",
           },
           data: body,
           timeout: ms,
@@ -391,9 +430,8 @@
 
         if (r && r.ok && r.text) {
           const errMsg = extractError(r.text);
-          if (errMsg) {
-            lastErr = "API: " + errMsg;
-          } else {
+          if (errMsg) { lastErr = "API: " + errMsg; }
+          else {
             const txt = extractContent(r.text);
             if (txt) {
               setWorkingModel(model);
@@ -401,20 +439,79 @@
               return { ok: true, text: txt, model: model };
             }
             lastErr = "empty";
-            if (rawLogCount < 3) {
+            if (rawLogCount < 4) {
               rawLogCount++;
-              log("RAW (rỗng) [" + model + "]: " + (r.text || "").slice(0, 220));
+              log("RAW rỗng [" + model + "]: " + (r.text || "").slice(0, 220));
             }
           }
-        } else if (r && r.error) {
-          lastErr = r.error;
-        } else if (r && r.status) {
-          lastErr = "HTTP " + r.status;
-        }
+        } else if (r && r.error) { lastErr = r.error; }
+        else if (r && r.status) { lastErr = "HTTP " + r.status; }
 
         log("↻ " + model + " lần " + (attempt + 1) + "/3 (lỗi: " + lastErr + ")");
         await sleep(600);
       }
+    }
+    return { ok: false, error: lastErr };
+  }
+
+  async function askAIVision(parts) {
+    const deadline = Date.now() + VISION_BUDGET_MS;
+    let lastErr = "unknown";
+    const messages = [
+      { role: "system", content: "Bạn là giáo viên. Đọc kỹ đề bài và hình ảnh, chỉ trả về JSON ngắn gọn." },
+      { role: "user", content: parts },
+    ];
+
+    for (let mi = 0; mi < VISION_MODELS.length; mi++) {
+      if (Date.now() > deadline) { lastErr = "budget-exceeded"; break; }
+      const model = VISION_MODELS[mi];
+      beat();
+
+      const payload = {
+        model: model,
+        messages: messages,
+        temperature: 0.1,
+        max_tokens: 500,
+        stream: false,
+        private: true,
+        referrer: "onluyen-solver",
+      };
+      const body = JSON.stringify(payload);
+      const headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + POLL_KEY,
+        "Accept": "application/json",
+      };
+
+      let r = await fetchJSON(PROXY_URL, { method: "POST", headers: headers, body: body }, VISION_TIMEOUT);
+
+      if (!r || !r.ok || !r.text) {
+        beat();
+        const g = await gmRequest(PROXY_URL, body, VISION_TIMEOUT);
+        if (g && g.ok && g.text) r = g;
+        else if (g && g.error) lastErr = g.error;
+      }
+
+      if (r && r.ok && r.text) {
+        const errMsg = extractError(r.text);
+        if (errMsg) { lastErr = "API: " + errMsg; }
+        else {
+          const txt = extractContent(r.text);
+          if (txt) {
+            log("👁 Vision (" + model + ") OK");
+            return { ok: true, text: txt, model: model };
+          }
+          lastErr = "empty";
+          if (rawLogCount < 5) {
+            rawLogCount++;
+            log("RAW vision [" + model + "]: " + (r.text || "").slice(0, 260));
+          }
+        }
+      } else if (r && r.error) { lastErr = r.error; }
+      else if (r && r.status) { lastErr = "HTTP " + r.status; }
+
+      log("↻ Vision " + model + " lỗi: " + lastErr);
+      await sleep(400);
     }
     return { ok: false, error: lastErr };
   }
@@ -426,12 +523,10 @@
     const hint = target
       ? "\n\n[ĐÂY LÀ CÂU HỎI ĐIỀN VÀO CHỖ TRỐNG SỐ (" + target + ") TRONG ĐOẠN VĂN TRÊN]"
       : "";
-
     const lines = opts.slice(0, MAX_OPTIONS).map((o, i) => {
       const lb = optionLabel(o) || String.fromCharCode(65 + i);
       return lb + ". " + optionText(o);
     });
-
     return [
       { role: "system", content: "Bạn là giáo viên giải bài tập. Chỉ trả về JSON ngắn gọn, không giải thích ngoài JSON." },
       { role: "user", content:
@@ -440,6 +535,40 @@
         '{"answer":"<chữ cái A/B/C/D>","explain":"<giải thích ngắn dưới 20 từ>"}'
       },
     ];
+  }
+
+  function buildVisionMcqParts(opts) {
+    const stem = getStemText();
+    const sImgs = stemImages();
+    const parts = [];
+
+    parts.push({ type: "text", text:
+      "Đây là câu hỏi trắc nghiệm tiếng Anh. Hãy đọc kỹ đề bài và TẤT CẢ các hình ảnh được gửi kèm, rồi chọn đáp án đúng nhất.\n\n" +
+      "ĐỀ BÀI:\n" + stem
+    });
+
+    sImgs.forEach((url, i) => {
+      parts.push({ type: "text", text: "\n[Hình " + (i + 1) + " trong đề bài — bảng số liệu/hình vẽ]" });
+      parts.push({ type: "image_url", image_url: { url: url } });
+    });
+
+    opts.forEach((opt, i) => {
+      const lb = optionLabel(opt) || String.fromCharCode(65 + i);
+      const img = optionImageUrl(opt);
+      const txt = optionText(opt);
+      if (img) {
+        parts.push({ type: "text", text: "\nĐÁP ÁN " + lb + " (hình ảnh đồ thị):" });
+        parts.push({ type: "image_url", image_url: { url: img } });
+      } else {
+        parts.push({ type: "text", text: "\nĐÁP ÁN " + lb + ": " + txt });
+      }
+    });
+
+    parts.push({ type: "text", text:
+      "\n\nHãy chọn đúng 1 đáp án đúng nhất. Trả về đúng định dạng JSON:\n" +
+      '{"answer":"<A/B/C/D>","explain":"<giải thích ngắn dưới 25 từ>"}'
+    });
+    return parts;
   }
 
   function buildFillMessages(stem, n) {
@@ -486,11 +615,16 @@
         key = String(o.answer || o.correct || o.letter || o.choice || "").trim();
       }
     } catch (e) {}
-    if (!key) {
-      const mm = s.match(/\b([A-L])\b/);
-      if (mm) key = mm[1];
-    }
-    return key.toUpperCase().replace(/[^A-L]/g, "");
+
+    const src = key || s;
+    const upper = src.toUpperCase();
+
+    if (/^[A-L]$/.test(upper)) return upper;
+    const m1 = upper.match(/^(?:OPTION\s*)?([A-L])[\s\.\)\:\-]/);
+    if (m1) return m1[1];
+    const m2 = upper.match(/\b([A-L])\b/);
+    if (m2) return m2[1];
+    return "";
   }
 
   function parseAnswerObj(raw, opts) {
@@ -506,7 +640,6 @@
       }
     } catch (e) {}
 
-    // If AI returned a full word/phrase, match against labels and option text
     if (inlineKey) {
       const upper = inlineKey.toUpperCase();
       for (let i = 0; i < opts.length; i++) {
@@ -517,19 +650,19 @@
       const lower = inlineKey.toLowerCase();
       for (let i = 0; i < opts.length; i++) {
         const t = optionText(opts[i]).toLowerCase();
-        if (t && (t === lower || t.indexOf(lower) >= 0 || lower.indexOf(t) >= 0)) {
+        if (t && t !== "." && (t === lower || t.indexOf(lower) >= 0 || lower.indexOf(t) >= 0)) {
           return { index: i, letter: optionLabel(opts[i]) || String.fromCharCode(65 + i), explain };
         }
       }
     }
 
-    // Fallback to letter parsing
     const key = parseAnswerLetter(raw);
     if (!key) return null;
 
     let idx = -1;
     for (let i = 0; i < opts.length; i++) {
-      if (optionLabel(opts[i]).toUpperCase().indexOf(key[0]) === 0) { idx = i; break; }
+      const lb = optionLabel(opts[i]).toUpperCase();
+      if (lb && lb.indexOf(key[0]) === 0) { idx = i; break; }
     }
     if (idx < 0) idx = key.charCodeAt(0) - 65;
     if (idx < 0 || idx >= opts.length) return null;
@@ -599,7 +732,6 @@
     try { opt.scrollIntoView({ block: "center" }); } catch (e) {}
     await sleep(80);
     try { opt.click(); } catch (e) {}
-    // Natively check the radio/checkbox (works for .select-item template)
     const inp = opt.querySelector('input[type="checkbox"], input[type="radio"]');
     if (inp && !inp.checked) {
       try { inp.focus(); } catch (e) {}
@@ -664,7 +796,6 @@
   async function advance() {
     beat();
     if (clickSheetNext()) { await sleep(1000); beat(); return true; }
-
     const bar = $(".mobile-bottom-bar");
     if (bar) {
       const btns = $$("button.nav-btn", bar);
@@ -674,7 +805,6 @@
         }
       }
     }
-
     const cands = $$("button, a.btn").filter((b) =>
       !insideGui(b) && !b.closest(".submit-bar") && !b.closest(".submit-button") &&
       !b.closest(".left-side") && !b.closest(".mobile-bottom-bar") && isVisible(b)
@@ -706,15 +836,56 @@
     const target = getTargetBlankNumber();
     if (target) log("→ Đích: điền chỗ trống (" + target + ")");
 
-    const res = await askAI(buildMcqMessages(opts));
-    if (!alive(myGen)) return;
-    if (!res.ok) { log("❌ AI lỗi: " + res.error + " — thử lại sau 5s."); await sleep(5000); return; }
+    // ---- image detection ----
+    const imgCount = opts.filter((o) => !!optionImageUrl(o)).length;
+    const sImgs = stemImages();
+    const visionOn = getVisionEnabled();
+    let useVision = false;
+
+    if (visionOn) {
+      if (imgCount >= 2) useVision = true;
+      else if (imgCount === 0 && sImgs.length > 0) useVision = true;
+    }
+
+    if (useVision) {
+      let totalSize = 0;
+      opts.forEach((o) => { const u = optionImageUrl(o); if (u) totalSize += u.length; });
+      sImgs.forEach((u) => { totalSize += u.length; });
+      if (totalSize > MAX_VISION_BYTES) {
+        log("⚠ Ảnh quá lớn (" + Math.round(totalSize / 1024) + "KB) — bỏ vision.");
+        useVision = false;
+      } else {
+        log("📷 Ảnh: " + imgCount + "/" + opts.length + " đáp án, " + sImgs.length +
+            " trong đề (" + Math.round(totalSize / 1024) + "KB) → vision.");
+      }
+    }
+
+    let res = null;
+    let usedVision = false;
+    if (useVision) {
+      res = await askAIVision(buildVisionMcqParts(opts));
+      if (!alive(myGen)) return;
+      if (res.ok) usedVision = true;
+      else log("⚠ Vision lỗi (" + res.error + ") — thử AI chữ.");
+    }
+
+    if (!res || !res.ok) {
+      res = await askAI(buildMcqMessages(opts));
+      if (!alive(myGen)) return;
+      if (!res.ok) { log("❌ AI lỗi: " + res.error + " — thử lại sau 5s."); await sleep(5000); return; }
+    }
 
     const pick = parseAnswerObj(res.text, opts);
-    if (!pick) { log("❌ Không đọc được đáp án: " + res.text.slice(0, 100)); await sleep(3000); return; }
+    if (!pick) {
+      log("❌ Không đọc được đáp án: " + res.text.slice(0, 120));
+      await sleep(3000);
+      return;
+    }
 
-    log("AI chọn " + pick.letter + ". " + optionText(opts[pick.index]).slice(0, 80) + " · " + (pick.explain || "").slice(0, 80));
-    showAnswer(pick.letter + ". " + optionText(opts[pick.index]).slice(0, 120));
+    const optTxt = optionText(opts[pick.index]).trim();
+    const display = optTxt && optTxt !== "." ? optTxt.slice(0, 100) : "(hình ảnh)";
+    log("AI chọn " + pick.letter + ". " + display + " · " + (pick.explain || "").slice(0, 80));
+    showAnswer(pick.letter + ". " + display);
 
     let ok = await applyAnswer(pick.index);
     if (!alive(myGen)) return;
@@ -722,28 +893,55 @@
     if (!ok) ok = await applyAnswer(pick.index);
 
     const verifyN = getVerifyCount();
-    for (let v = 0; v < verifyN; v++) {
-      if (!alive(myGen)) return;
+    if (usedVision && verifyN > 0) {
       beat();
-      const chosen = optionLabel(opts[pick.index]) + ". " + optionText(opts[pick.index]);
-      const vr = await askAI(buildVerifyMessages(stem, chosen));
+      const parts2 = buildVisionMcqParts(opts);
+      parts2.push({ type: "text", text:
+        "\n\nLần đầu đã chọn đáp án " + pick.letter +
+        ". Hãy KIỂM TRA LẠI THẬT KỸ hình ảnh + đề bài. Nếu đúng, lặp lại đáp án đó; nếu sai, chọn lại đáp án đúng nhất. Trả JSON."
+      });
+      const vr = await askAIVision(parts2);
       if (!alive(myGen)) return;
-      if (!vr.ok) { log("… kiểm tra " + (v + 1) + " bỏ qua (" + vr.error + ")"); continue; }
-      let needFix = false;
-      try {
-        const m = vr.text.match(/\{[\s\S]*\}/);
-        if (m) { const o = JSON.parse(m[0]); if (o && o.ok === false) needFix = true; }
-      } catch (e) {}
-      if (needFix) {
+      if (vr.ok) {
         const np = parseAnswerObj(vr.text, opts);
         if (np && np.index !== pick.index) {
-          log("↻ Kiểm tra sai — đổi sang " + np.letter);
+          log("↻ Vision kiểm tra đổi " + pick.letter + " → " + np.letter);
           pick.index = np.index; pick.letter = np.letter;
           await applyAnswer(pick.index);
-          continue;
+        } else if (np) {
+          log("✓ Vision kiểm tra giữ: " + pick.letter);
+        } else {
+          log("… Vision kiểm tra không đọc được, giữ nguyên.");
         }
+      } else {
+        log("… Vision kiểm tra bỏ qua (" + vr.error + ")");
       }
-      log("✓ Kiểm tra " + (v + 1) + " giữ: " + pick.letter);
+    } else if (!usedVision && imgCount < 2) {
+      for (let v = 0; v < verifyN; v++) {
+        if (!alive(myGen)) return;
+        beat();
+        const chosen = optionLabel(opts[pick.index]) + ". " + optionText(opts[pick.index]);
+        const vr = await askAI(buildVerifyMessages(stem, chosen));
+        if (!alive(myGen)) return;
+        if (!vr.ok) { log("… kiểm tra " + (v + 1) + " bỏ qua (" + vr.error + ")"); continue; }
+        let needFix = false;
+        try {
+          const m = vr.text.match(/\{[\s\S]*\}/);
+          if (m) { const o = JSON.parse(m[0]); if (o && o.ok === false) needFix = true; }
+        } catch (e) {}
+        if (needFix) {
+          const np = parseAnswerObj(vr.text, opts);
+          if (np && np.index !== pick.index) {
+            log("↻ Kiểm tra sai — đổi sang " + np.letter);
+            pick.index = np.index; pick.letter = np.letter;
+            await applyAnswer(pick.index);
+            continue;
+          }
+        }
+        log("✓ Kiểm tra " + (v + 1) + " giữ: " + pick.letter);
+      }
+    } else if (imgCount >= 2 && !usedVision) {
+      log("… Bỏ kiểm tra (đáp án là hình, không có vision).");
     }
 
     const btn = await findNewAnswerButton(before);
@@ -797,8 +995,7 @@
       const t = (btn.textContent || "").trim();
       btn.click();
       log('Bấm nút: "' + t + '"');
-      await sleep(1300);
-      beat();
+      await sleep(1300); beat();
     } else {
       log("⚠ Không thấy nút Trả lời trong submit-bar.");
     }
@@ -836,8 +1033,7 @@
       const t = (btn.textContent || "").trim();
       btn.click();
       log('Bấm nút: "' + t + '"');
-      await sleep(1300);
-      beat();
+      await sleep(1300); beat();
     } else {
       log("⚠ Không thấy nút Trả lời/Lưu cho tự luận.");
     }
@@ -857,6 +1053,9 @@
     const v = parseInt(localStorage.getItem(VERIFY_KEY) || "1", 10);
     return isNaN(v) ? 1 : Math.max(0, Math.min(3, v));
   }
+  function getVisionEnabled() {
+    return localStorage.getItem(VISION_KEY) !== "0";
+  }
 
   async function loop() {
     const myGen = ++state.gen;
@@ -864,19 +1063,15 @@
     log("▶ Vòng lặp bắt đầu (gen " + myGen + ")");
 
     let noQ = 0;
-
     while (state.running && myGen === state.gen) {
       try {
         beat();
-
         if (!hasQuestion()) {
           noQ++;
           if (noQ === 1 || noQ % 5 === 0) {
             log("⏳ Chưa thấy input/option (" + noQ + "/20) · " + qRootDiag());
           }
-          if (noQ === 3) {
-            log("💡 Q này lạ? Bấm 🔬 Dump HTML để gửi admin xem cấu trúc.");
-          }
+          if (noQ === 3) log("💡 Q này lạ? Bấm 🔬 Dump HTML để gửi admin xem cấu trúc.");
           if (noQ >= 20) {
             log("⚠ 30s không nhận dạng được — thử chuyển câu.");
             noQ = 0;
@@ -884,15 +1079,11 @@
             if (!alive(myGen)) return;
             if (!moved) {
               log("❌ Không chuyển được câu — dừng. Bấm 🔬 Dump HTML gửi admin.");
-              state.running = false;
-              setStatus("Trang không nhận dạng");
-              break;
+              state.running = false; setStatus("Trang không nhận dạng"); break;
             }
-            await sleep(1500);
-            continue;
+            await sleep(1500); continue;
           }
-          await sleep(1500);
-          continue;
+          await sleep(1500); continue;
         }
         noQ = 0;
 
@@ -906,17 +1097,16 @@
           const moved = await advance();
           if (!alive(myGen)) return;
           if (!moved) { log("⚠ Không chuyển được — dừng."); state.running = false; setStatus("Không chuyển được"); break; }
-          await sleep(1200);
-          continue;
+          await sleep(1200); continue;
         }
 
         const opts  = getOptions();
         const fills = opts.length ? [] : getFillInputs();
         const areas = (opts.length || fills.length) ? [] : getEssayTextareas();
 
-        if (opts.length)        await stepMcq(opts, myGen);
-        else if (fills.length)  await stepFill(fills, myGen);
-        else if (areas.length)  await stepEssay(areas, myGen);
+        if (opts.length)       await stepMcq(opts, myGen);
+        else if (fills.length) await stepFill(fills, myGen);
+        else if (areas.length) await stepEssay(areas, myGen);
 
         if (!alive(myGen)) return;
         await sleep(getInterval());
@@ -925,7 +1115,6 @@
         await sleep(2000);
       }
     }
-
     log("■ Vòng lặp dừng (gen " + myGen + ")");
   }
 
@@ -964,15 +1153,17 @@
       const els = $$(s);
       log("  " + s + ": " + (els.length ? ("×" + els.length) : "✗"));
     });
-
     log("  .question-name kids: " + childTags($(".question-name")));
     log("  #test-step-question kids: " + childTags($("#test-step-question"), 8));
 
     const opts = getOptions();
     log("  Options (getOptions): " + opts.length + (opts.length ? " (" + opts.map((o) => optionLabel(o) + "=" + optionText(o).slice(0, 20)).join(" | ") + ")" : ""));
 
-    log("  Target blank: " + (getTargetBlankNumber() || "(không phải Blank-numbered)"));
+    const optImgCount = opts.filter((o) => !!optionImageUrl(o)).length;
+    const sImgs = stemImages();
+    log("  Option images: " + optImgCount + "/" + opts.length + " · Stem images: " + sImgs.length + " · Vision ON: " + getVisionEnabled());
 
+    log("  Target blank: " + (getTargetBlankNumber() || "(không phải Blank-numbered)"));
     log("  Fill inputs: " + getFillInputs().length);
     log("  Essay textareas: " + getEssayTextareas().length);
 
@@ -989,7 +1180,7 @@
   }
 
   async function testAI() {
-    log("=== TEST AI ===");
+    log("=== TEST AI (text) ===");
     const model = localStorage.getItem(MODEL_CUSTOM_KEY) || localStorage.getItem(MODEL_KEY) || DEFAULT_MODEL;
     log("Model: " + model);
     const body = JSON.stringify({
@@ -997,7 +1188,7 @@
       messages: [{ role: "user", content: "Respond exactly with the word OK" }],
       temperature: 0.1,
       max_tokens: 20,
-      stream: false
+      stream: false,
     });
     const headers = {
       "Content-Type": "application/json",
@@ -1012,9 +1203,32 @@
     }
     log("Status: " + (r && (r.status || r.error || "?")));
     log("RAW: " + ((r && r.text) || "(rỗng)").slice(0, 320));
-    const ext = r && r.text ? extractContent(r.text) : "";
-    log("Extracted: " + (ext || "(rỗng)"));
+    log("Extracted: " + ((r && r.text && extractContent(r.text)) || "(rỗng)"));
     log("======================");
+
+    // Vision test if page has images
+    const opts = getOptions();
+    const sImgs = stemImages();
+    const anyImg = sImgs.length > 0 || opts.some((o) => !!optionImageUrl(o));
+    if (anyImg) {
+      log("=== TEST VISION ===");
+      const totalSize = sImgs.reduce((a, u) => a + u.length, 0) +
+                        opts.reduce((a, o) => a + (optionImageUrl(o) || "").length, 0);
+      log("Ảnh stem: " + sImgs.length + " · Ảnh options: " + opts.filter((o) => !!optionImageUrl(o)).length +
+          " · Tổng " + Math.round(totalSize / 1024) + "KB");
+      log("Models sẽ thử: " + VISION_MODELS.join(" → "));
+      const parts = buildVisionMcqParts(opts);
+      log("Số content parts: " + parts.length + " (image parts: " + parts.filter((p) => p.type === "image_url").length + ")");
+      log("Gửi request vision...");
+      const vres = await askAIVision(parts);
+      if (vres.ok) {
+        log("✅ Vision OK (" + vres.model + ")");
+        log("Extracted: " + vres.text.slice(0, 240));
+      } else {
+        log("❌ Vision fail: " + vres.error);
+      }
+      log("======================");
+    }
   }
 
   function showHTMLModal(html) {
@@ -1041,11 +1255,8 @@
     closeBtn.textContent = "❌ Đóng";
     closeBtn.style.cssText = "flex:1;padding:12px;font-size:14px;font-weight:700;background:#dc2626;color:#fff;border:0;border-radius:8px;cursor:pointer;";
     closeBtn.onclick = () => overlay.remove();
-    row.appendChild(copyBtn);
-    row.appendChild(closeBtn);
-    overlay.appendChild(title);
-    overlay.appendChild(ta);
-    overlay.appendChild(row);
+    row.appendChild(copyBtn); row.appendChild(closeBtn);
+    overlay.appendChild(title); overlay.appendChild(ta); overlay.appendChild(row);
     document.body.appendChild(overlay);
     setTimeout(() => { try { ta.focus(); ta.select(); } catch (e) {} }, 100);
   }
@@ -1053,8 +1264,10 @@
   async function dumpHTML() {
     const root = qRoot();
     if (!root) { log("❌ Không tìm thấy container câu hỏi."); return; }
-    const html = root.outerHTML.replace(/\s+/g, " ").trim();
-    log("📋 HTML length: " + html.length + " ký tự.");
+    const full = root.outerHTML.replace(/\s+/g, " ").trim();
+    // Strip base64 to keep the dump small & readable
+    const html = full.replace(/data:image\/[a-zA-Z]+;base64,[A-Za-z0-9+/=]+/g, "data:image/BASE64_OMITTED");
+    log("📋 HTML length: " + html.length + " ký tự (base64 đã lược bỏ).");
     try {
       await navigator.clipboard.writeText(html);
       log("✅ Đã copy HTML vào clipboard.");
@@ -1093,7 +1306,7 @@
       "#" + GUI_ID + " .ais-answer{background:#052e16;border:1px solid #166534;color:#bbf7d0;border-radius:8px;",
       "padding:6px;min-height:20px;word-break:break-word}",
       "#" + GUI_ID + " .ais-log{background:#020617;border:1px solid #1e293b;border-radius:8px;padding:6px;",
-      "height:160px;overflow:auto;font:11px/1.4 ui-monospace,Consolas,monospace;color:#94a3b8;white-space:pre-wrap}",
+      "height:170px;overflow:auto;font:11px/1.4 ui-monospace,Consolas,monospace;color:#94a3b8;white-space:pre-wrap}",
       "#" + GUI_ID + " .ais-foot{padding:6px 10px;background:#1e293b;color:#64748b;font-size:10px;text-align:center}",
       "#" + GUI_ID + ".ais-collapsed .ais-body,#" + GUI_ID + ".ais-collapsed .ais-foot{display:none}",
     ].join("");
@@ -1102,13 +1315,14 @@
     const box = document.createElement("div");
     box.id = GUI_ID;
     box.innerHTML =
-      '<div class="ais-head"><span class="ais-title">⚡ ai slover v39.7</span>' +
+      '<div class="ais-head"><span class="ais-title">⚡ ai slover v39.8</span>' +
       '<button class="ais-min" title="Thu nhỏ">–</button></div>' +
       '<div class="ais-body">' +
         '<label class="ais-row">Model<select class="ais-model"></select></label>' +
         '<label class="ais-row">Model khác<input class="ais-custom" type="text" placeholder="vd: openai"></label>' +
         '<label class="ais-row">Chu kỳ (ms)<input class="ais-interval" type="number" min="1200" step="500"></label>' +
         '<label class="ais-row">Kiểm tra lại<input class="ais-verify" type="number" min="0" max="3" step="1"></label>' +
+        '<label class="ais-check"><input class="ais-vision" type="checkbox" checked> 📷 Dùng AI đọc hình (vision)</label>' +
         '<label class="ais-check"><input class="ais-redo" type="checkbox"> Làm lại câu đã đúng</label>' +
         '<label class="ais-check"><input class="ais-autosubmit" type="checkbox"> Tự nộp bài khi hết câu (nguy hiểm)</label>' +
         '<div class="ais-actions"><button class="ais-start">▶ Start</button><button class="ais-stop">■ Stop</button></div>' +
@@ -1118,7 +1332,7 @@
         '<div class="ais-answer" id="ais-answer">—</div>' +
         '<div class="ais-log" id="ais-log"></div>' +
       '</div>' +
-      '<div class="ais-foot">v39.7 · hỗ trợ "Blank numbered" (select-item + radio) · chống treo 60s</div>';
+      '<div class="ais-foot">v39.8 · Vision (đọc ảnh) · Blank-numbered · chống treo 60s</div>';
 
     document.body.appendChild(box);
 
@@ -1132,7 +1346,6 @@
       o.value = m; o.textContent = m;
       sel.appendChild(o);
     });
-
     const savedModel = localStorage.getItem(MODEL_KEY) || DEFAULT_MODEL;
     if (MODEL_CHOICES.indexOf(savedModel) === -1) {
       const o = document.createElement("option");
@@ -1169,6 +1382,13 @@
       const v = Math.max(0, Math.min(3, parseInt(verifyInp.value, 10) || 0));
       verifyInp.value = v;
       localStorage.setItem(VERIFY_KEY, String(v));
+    });
+
+    const visionChk = $(".ais-vision", box);
+    visionChk.checked = getVisionEnabled();
+    visionChk.addEventListener("change", () => {
+      localStorage.setItem(VISION_KEY, visionChk.checked ? "1" : "0");
+      log("Vision: " + (visionChk.checked ? "BẬT" : "TẮT"));
     });
 
     const redo = $(".ais-redo", box);
@@ -1221,6 +1441,7 @@
     state.lastBeat = Date.now();
     setStatus("Đang chạy...");
     log("Model chain: " + modelChain().join(" → "));
+    log("Vision chain: " + VISION_MODELS.join(" → ") + " (bật: " + getVisionEnabled() + ")");
     loop();
   }
 
