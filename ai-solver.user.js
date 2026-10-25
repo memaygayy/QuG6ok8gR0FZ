@@ -1,1469 +1,1485 @@
 // ==UserScript==
-// @name         AI Solver v39.8
-// @namespace    https://onluyen.vn/
-// @version      39.8.0
-// @description  Auto solve onluyen.vn + vision cho đáp án là hình ảnh
+// @name         AI Solver v39.9
+// @namespace    https://github.com/memaygayy/QuG6ok8gR0FZ
+// @version      39.9.0
+// @description  Tự động giải trắc nghiệm / điền từ / tự luận / blank-numbered / đáp án hình ảnh trên onluyen.vn (model FREE)
+// @author       memaygayy
 // @match        https://*.onluyen.vn/*
 // @match        https://onluyen.vn/*
 // @grant        GM_xmlhttpRequest
 // @connect      pollinations.ai
 // @connect      gen.pollinations.ai
+// @connect      text.pollinations.ai
 // @connect      *
-// @updateURL    https://raw.githubusercontent.com/memaygayy/QuG6ok8gR0FZ/main/ai-solver.user.js
-// @downloadURL  https://raw.githubusercontent.com/memaygayy/QuG6ok8gR0FZ/main/ai-solver.user.js
 // @run-at       document-idle
 // @noframes
+// @updateURL    https://raw.githubusercontent.com/memaygayy/QuG6ok8gR0FZ/main/ai-solver.user.js
+// @downloadURL  https://raw.githubusercontent.com/memaygayy/QuG6ok8gR0FZ/main/ai-solver.user.js
 // ==/UserScript==
 
 (function () {
   "use strict";
+  if (window.__AI_SOLVER_39_9__) return;
+  window.__AI_SOLVER_39_9__ = true;
 
-  /* ================= CONFIG ================= */
-  const VERSION_STR = "39.8.0";
-  const GUI_ID      = "ai-solver-v38";
-  const PROXY_URL   = "https://gen.pollinations.ai/v1/chat/completions";
-  const POLL_KEY    = "sk_D8PP0K4jFUDUa0zjrx7uxq1XM1ZoVINK";
+  /* ============================ CONFIG ============================ */
+  const VERSION_STR = "39.9.0";
+  const GUI_ID = "ai-solver-v38";
+  const PROXY_URL = "https://gen.pollinations.ai/v1/chat/completions";
+  const MODELS_URLS = [
+    "https://text.pollinations.ai/models",
+    "https://gen.pollinations.ai/models"
+  ];
+  const POLL_KEY = "sk_D8PP0K4jFUDUa0zjrx7uxq1XM1ZoVINK";
 
-  const MODEL_KEY        = "HW_SOLVER_MODEL_V2";
+  const MODEL_KEY = "HW_SOLVER_MODEL_V3";          // bump V2 -> V3 để bỏ model trả phí cũ
   const MODEL_CUSTOM_KEY = "HW_SOLVER_MODEL_CUSTOM";
-  const MODEL_WORKING    = "HW_SOLVER_MODEL_WORKING";
-  const INTERVAL_KEY     = "HW_SOLVER_INTERVAL";
-  const VERIFY_KEY       = "HW_SOLVER_VERIFY";
-  const AUTOSUBMIT_KEY   = "HW_SOLVER_AUTO_SUBMIT";
-  const REDO_KEY         = "HW_SOLVER_REDO_DONE";
-  const VISION_KEY       = "HW_SOLVER_VISION";
+  const MODEL_WORKING = "HW_SOLVER_MODEL_WORKING_V3";
+  const PAID_KEY = "HW_SOLVER_PAID_MODELS";
+  const INTERVAL_KEY = "HW_SOLVER_INTERVAL";
+  const VERIFY_KEY = "HW_SOLVER_VERIFY";
+  const AUTOSUBMIT_KEY = "HW_SOLVER_AUTO_SUBMIT";
+  const REDO_KEY = "HW_SOLVER_REDO_DONE";
+  const VISION_KEY = "HW_SOLVER_VISION";
 
-  const DEFAULT_MODEL   = "deepseek/deepseek-v4-flash";
-  const FALLBACK_MODELS = ["deepseek", "openai", "openai-fast", "gemini"];
-  const MODEL_CHOICES   = ["deepseek/deepseek-v4-flash", "deepseek", "gemini", "openai", "claude"];
+  // Model FREE + mạnh. gemini free và đọc được ảnh.
+  const DEFAULT_MODEL = "gemini";
+  const FALLBACK_MODELS = ["gemini", "openai-fast", "openai", "mistral", "deepseek", "qwen-coder", "nova-fast"];
+  const MODEL_CHOICES = [
+    "gemini", "openai-fast", "openai", "mistral",
+    "deepseek", "qwen-coder", "nova-fast", "llama", "claude",
+    "deepseek/deepseek-v4-flash"
+  ];
+  const VISION_MODELS = ["gemini", "openai", "openai-fast", "openai-large", "mistral"];
 
-  const VISION_MODELS  = ["gemini", "openai-large", "openai", "openai-fast"];
+  const MAX_OPTIONS = 12;
+  const API_TIMEOUT = 35000;
+  const VISION_TIMEOUT = 45000;
+  const ASK_BUDGET_MS = 95000;
+  const VISION_BUDGET_MS = 110000;
+  const WATCHDOG_MS = 60000;
+  const MAX_VISION_BYTES = 4000000;
 
-  const MAX_OPTIONS        = 12;
-  const API_TIMEOUT        = 35000;
-  const VISION_TIMEOUT     = 45000;
-  const ASK_BUDGET_MS      = 110000;
-  const VISION_BUDGET_MS   = 120000;
-  const WATCHDOG_MS        = 60000;
-  const MAX_VISION_BYTES   = 4000000;
-
-  const BAD_BTN_RE    = /(bỏ qua|skip|nộp bài|nộp|xác nhận nộp|hủy|huỷ|cancel|thoát|đóng|close|báo lỗi)/i;
-  const NEXT_RE       = /(câu tiếp|câu sau|tiếp theo|câu kế|kế tiếp|next)/i;
+  const BAD_BTN_RE = /(bỏ qua|skip|nộp bài|nộp|xác nhận nộp|hủy|huỷ|cancel|thoát|đóng|close|báo lỗi)/i;
+  const NEXT_RE = /(câu tiếp|câu sau|tiếp theo|câu kế|kế tiếp|next)/i;
   const ANSWER_BTN_RE = /(trả lời|làm bài|kiểm tra|xác nhận|gửi|lưu|answer)/i;
 
-  /* ================= STATE ================= */
-  const state = {
-    running:  false,
-    gen:      0,
-    lastBeat: Date.now(),
-    lastSig:  "",
-    sameCount: 0,
-    answered: 0,
-  };
+  /* ============================ STATE ============================ */
+  let running = false;
+  let genToken = 0;
+  let pendingTokens = 0;
+  const logBuf = [];
 
-  const beat  = () => { state.lastBeat = Date.now(); };
-  const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms | 0)));
-  const alive = (myGen) => state.running && myGen === state.gen;
+  /* ============================ UTILS ============================ */
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  /* ================= LOG ================= */
-  let logEl = null, statusEl = null, answerEl = null;
+  function qsa(sel, root) {
+    try { return Array.from((root || document).querySelectorAll(sel)); }
+    catch (e) { return []; }
+  }
+  function qs(sel, root) {
+    try { return (root || document).querySelector(sel); }
+    catch (e) { return null; }
+  }
+  function visible(el) {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const s = window.getComputedStyle(el);
+    if (s.display === "none" || s.visibility === "hidden") return false;
+    if (parseFloat(s.opacity || "1") === 0) return false;
+    return true;
+  }
+  function insideGui(el) {
+    if (!el || !el.closest) return false;
+    if (el.closest("#" + GUI_ID)) return true;
+    if (el.closest(".answer-sheet")) return true;
+    if (el.closest(".mobile-bottom-bar")) return true;
+    if (el.closest(".left-side")) return true;
+    return false;
+  }
 
   function log(msg) {
-    beat();
-    const line = "[" + new Date().toLocaleTimeString("vi-VN") + "] " + msg;
-    try { console.log("[AI-SOLVER]", msg); } catch (e) {}
-    if (!logEl) return;
-    const d = document.createElement("div");
-    d.textContent = line;
-    logEl.appendChild(d);
-    while (logEl.childNodes.length > 220) logEl.removeChild(logEl.firstChild);
-    logEl.scrollTop = logEl.scrollHeight;
+    const line = "[" + new Date().toLocaleTimeString("vi-VN", { hour12: false }) + "] " + msg;
+    logBuf.push(line);
+    if (logBuf.length > 400) logBuf.shift();
+    try { console.log("[AI-SOLVER] " + msg); } catch (e) {}
+    const el = document.getElementById("ais-log");
+    if (el) {
+      const d = document.createElement("div");
+      d.textContent = line;
+      el.appendChild(d);
+      while (el.childNodes.length > 240) el.removeChild(el.firstChild);
+      el.scrollTop = el.scrollHeight;
+    }
   }
-  function setStatus(s) { if (statusEl) statusEl.textContent = s; }
-  function showAnswer(s) { if (answerEl) answerEl.textContent = s || "—"; }
+  function setStatus(t) {
+    const el = document.getElementById("ais-status");
+    if (el) el.textContent = t;
+  }
+  function showAnswer(t) {
+    const el = document.getElementById("ais-answer");
+    if (el) el.textContent = t || "";
+  }
 
-  /* ================= DOM HELPERS ================= */
-  const $  = (s, r) => (r || document).querySelector(s);
-  const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
+  /* ============================ STORAGE ============================ */
+  function lsGet(k, d) {
+    try { const v = localStorage.getItem(k); return v == null ? d : v; } catch (e) { return d; }
+  }
+  function lsSet(k, v) {
+    try { localStorage.setItem(k, String(v)); } catch (e) {}
+  }
+  function lsBool(k, d) {
+    const v = lsGet(k, null);
+    if (v === null) return d;
+    return v === "1" || v === "true";
+  }
 
-  function insideGui(el) { return !!(el && el.closest && el.closest("#" + GUI_ID)); }
+  function getInterval() {
+    const n = parseInt(lsGet(INTERVAL_KEY, "900"), 10);
+    return isNaN(n) ? 900 : Math.max(300, Math.min(10000, n));
+  }
+  function getVerifyTimes() {
+    const n = parseInt(lsGet(VERIFY_KEY, "1"), 10);
+    return isNaN(n) ? 1 : Math.max(0, Math.min(3, n));
+  }
+  function getVisionEnabled() { return lsBool(VISION_KEY, true); }
+  function getRedo() { return lsBool(REDO_KEY, true); }
+  function getAutoSubmit() { return lsBool(AUTOSUBMIT_KEY, false); }
 
-  function isVisible(el) {
-    if (!el || !el.getClientRects) return false;
-    if (!el.getClientRects().length) return false;
-    const st = getComputedStyle(el);
-    if (st.display === "none" || st.visibility === "hidden") return false;
-    const isCheck = el.tagName === "INPUT" && (el.type === "radio" || el.type === "checkbox");
-    if (!isCheck && st.opacity === "0") return false;
-    return true;
+  function getModel() {
+    const custom = (lsGet(MODEL_CUSTOM_KEY, "") || "").trim();
+    if (custom) return custom;
+    const m = (lsGet(MODEL_KEY, "") || "").trim();
+    return m || DEFAULT_MODEL;
+  }
+  function setModel(m) {
+    if (!m) return;
+    lsSet(MODEL_KEY, m);
+    if ((lsGet(MODEL_CUSTOM_KEY, "") || "").trim() === m) lsSet(MODEL_CUSTOM_KEY, "");
+  }
+  function getWorkingModel() { return (lsGet(MODEL_WORKING, "") || "").trim(); }
+  function setWorkingModel(m) { if (m) lsSet(MODEL_WORKING, m); }
+
+  function getPaidSet() {
+    try {
+      const arr = JSON.parse(lsGet(PAID_KEY, "[]"));
+      return new Set(Array.isArray(arr) ? arr : []);
+    } catch (e) { return new Set(); }
+  }
+  function markPaid(model) {
+    if (!model) return;
+    const s = getPaidSet();
+    s.add(String(model));
+    lsSet(PAID_KEY, JSON.stringify(Array.from(s)));
+  }
+  function isPaid(model) { return getPaidSet().has(String(model)); }
+  function clearPaid() { lsSet(PAID_KEY, "[]"); }
+
+  /* ============================ NETWORK ============================ */
+  function gmRequest(opts) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (v) => { if (!done) { done = true; resolve(v); } };
+      const to = opts.timeout || API_TIMEOUT;
+      const guard = setTimeout(() => finish({ ok: false, status: 0, err: "timeout(outer)" }), to + 4000);
+      try {
+        GM_xmlhttpRequest({
+          method: opts.method || "POST",
+          url: opts.url,
+          headers: opts.headers || {},
+          data: opts.data,
+          timeout: to,
+          onload: (r) => {
+            clearTimeout(guard);
+            finish({ ok: r.status >= 200 && r.status < 300, status: r.status, text: r.responseText || "" });
+          },
+          onerror: () => { clearTimeout(guard); finish({ ok: false, status: 0, err: "network error" }); },
+          ontimeout: () => { clearTimeout(guard); finish({ ok: false, status: 0, err: "timeout" }); },
+          onabort: () => { clearTimeout(guard); finish({ ok: false, status: 0, err: "abort" }); }
+        });
+      } catch (e) {
+        clearTimeout(guard);
+        finish({ ok: false, status: 0, err: String((e && e.message) || e) });
+      }
+    });
+  }
+
+  function isPaidError(status, msg) {
+    const s = String(msg || "").toLowerCase();
+    if (status === 402) return true;
+    return /not enough credits|top up|needs paid|insufficient|balance|pollen.*(credit|paid)|paid pollen|requires? (a )?paid/i.test(s);
+  }
+
+  function extractContent(json) {
+    if (!json) return "";
+    const ch = json.choices && json.choices[0];
+    if (!ch) return "";
+    const msg = ch.message || ch.delta || {};
+    let c = msg.content;
+    if (Array.isArray(c)) {
+      c = c.map((p) => (typeof p === "string" ? p : (p && (p.text || p.content)) || "")).join("");
+    }
+    if (typeof c === "string" && c.trim()) return c.trim();
+    if (typeof ch.text === "string" && ch.text.trim()) return ch.text.trim();
+    return "";
+  }
+
+  async function callModel(model, messages, timeout) {
+    const body = {
+      model: model,
+      messages: messages,
+      temperature: 0.2,
+      private: true,
+      referrer: "onluyen-solver"
+    };
+    const r = await gmRequest({
+      url: PROXY_URL,
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + POLL_KEY
+      },
+      data: JSON.stringify(body),
+      timeout: timeout || API_TIMEOUT
+    });
+
+    if (!r.ok) {
+      const msg = String(r.text || r.err || "").slice(0, 300);
+      if (isPaidError(r.status, msg)) return { ok: false, paid: true, status: r.status, err: msg };
+      return { ok: false, paid: false, status: r.status, err: msg };
+    }
+    let json = null;
+    try { json = JSON.parse(r.text); }
+    catch (e) { return { ok: false, paid: false, status: r.status, err: "bad JSON" }; }
+    const content = extractContent(json);
+    if (!content) return { ok: false, paid: false, status: r.status, err: "empty content" };
+    return { ok: true, text: content };
+  }
+
+  function isVisionModel(m) {
+    const s = String(m || "").toLowerCase();
+    return VISION_MODELS.some((v) => s.indexOf(v) >= 0);
+  }
+
+  function buildChain(needVision) {
+    const chosen = getModel();
+    const out = [];
+    const push = (m) => {
+      if (!m) return;
+      if (out.indexOf(m) >= 0) return;
+      if (isPaid(m)) return;
+      out.push(m);
+    };
+    push(chosen);
+    push(getWorkingModel());
+    FALLBACK_MODELS.forEach(push);
+
+    let list = out;
+    if (needVision) {
+      list = out.filter(isVisionModel).concat(out.filter((m) => !isVisionModel(m)));
+    }
+    return list.slice(0, 5);
+  }
+
+  async function askAI(messages, opts) {
+    const budget = (opts && opts.budget) || ASK_BUDGET_MS;
+    const chain = buildChain(false);
+    const start = Date.now();
+    if (!chain.length) { log("⚠ Không còn model nào (tất cả bị đánh dấu trả phí). Bấm 🌐 Model free."); return { ok: false }; }
+
+    for (const model of chain) {
+      const left = budget - (Date.now() - start);
+      if (left < 4000) break;
+      const to = Math.min(API_TIMEOUT, left);
+      log("… gọi " + model);
+      const r = await callModel(model, messages, to);
+      if (r.ok) {
+        setWorkingModel(model);
+        log("AI (" + model + ") OK");
+        return { ok: true, text: r.text, model: model };
+      }
+      if (r.paid) { markPaid(model); log("💳 " + model + " cần trả phí → bỏ, thử model khác."); continue; }
+      log("✗ " + model + " → " + String(r.err || ("status " + r.status)).slice(0, 120));
+    }
+    return { ok: false };
+  }
+
+  async function askAIVision(messages, opts) {
+    const budget = (opts && opts.budget) || VISION_BUDGET_MS;
+    const chain = buildChain(true);
+    const start = Date.now();
+
+    for (const model of chain) {
+      const left = budget - (Date.now() - start);
+      if (left < 5000) break;
+      if (!isVisionModel(model)) continue;
+      const to = Math.min(VISION_TIMEOUT, left);
+      log("… [vision] " + model);
+      const r = await callModel(model, messages, to);
+      if (r.ok) {
+        setWorkingModel(model);
+        log("👁 Vision (" + model + ") OK");
+        return { ok: true, text: r.text, model: model };
+      }
+      if (r.paid) { markPaid(model); log("💳 [vision] " + model + " cần trả phí → bỏ."); continue; }
+      log("✗ [vision] " + model + " → " + String(r.err || ("status " + r.status)).slice(0, 120));
+    }
+    return { ok: false };
+  }
+
+  async function refreshModelList() {
+    log("=== 🌐 LẤY DANH SÁCH MODEL ===");
+    for (const url of MODELS_URLS) {
+      const r = await gmRequest({ method: "GET", url: url, headers: {}, timeout: 15000 });
+      if (!r.ok) { log("✗ " + url + " → " + (r.status || r.err)); continue; }
+      try {
+        const arr = JSON.parse(r.text);
+        if (!Array.isArray(arr)) { log("✗ " + url + " không phải mảng"); continue; }
+        const names = arr.map((m) => (typeof m === "string" ? m : m.name || m.id || "")).filter(Boolean);
+        const free = arr.filter((m) => typeof m === "object" && !m.paid_only && !m.paidOnly && m.tier !== "paid"
+          && !/paid/i.test(String(m.tier || "")));
+        const freeNames = free.map((m) => (typeof m === "string" ? m : m.name || m.id || "")).filter(Boolean);
+        log("📋 " + url + " → " + names.length + " model");
+        log("FREE (" + freeNames.length + "): " + freeNames.slice(0, 60).join(", "));
+        const paidNames = names.filter((n) => freeNames.indexOf(n) < 0);
+        if (paidNames.length) log("PAID (" + paidNames.length + "): " + paidNames.slice(0, 40).join(", "));
+        const vm = free.filter((m) => typeof m === "object" && (m.vision === true || m.supports_vision === true)).map((m) => m.name || m.id);
+        if (vm.length) log("👁 Vision free: " + vm.join(", "));
+        log("=== HẾT DANH SÁCH ===");
+        return freeNames;
+      } catch (e) {
+        log("✗ parse " + url + " lỗi");
+      }
+    }
+    log("=== KHÔNG LẤY ĐƯỢC DANH SÁCH ===");
+    return [];
+  }
+
+  /* ============================ PARSERS ============================ */
+  function normalizeLetter(v, labels) {
+    const s = String(v == null ? "" : v).trim();
+    const up = s.toUpperCase();
+    if (/^[A-L]$/.test(up) && labels.indexOf(up) >= 0) return up;
+    const m = up.match(/^(?:OPTION|ĐÁP ÁN|DAP AN|ANSWER|CHỌN|CHON)?\s*[:\-\.]?\s*([A-L])\b/);
+    if (m && labels.indexOf(m[1]) >= 0) return m[1];
+    return "";
+  }
+
+  function parseAnswerLetter(raw, labels) {
+    if (!raw) return "";
+    const text = String(raw);
+    let m = text.match(/(?:ĐÁP ÁN|DAP AN|ANSWER|CHỌN|CHON)\s*(?:LÀ|LA|IS|:)?\s*[:\-\s]*([A-L])\b/i);
+    if (m) { const c = m[1].toUpperCase(); if (labels.indexOf(c) >= 0) return c; }
+
+    m = text.match(/["'`]\s*([A-L])\s*["'`]/);
+    if (m && labels.indexOf(m[1]) >= 0) return m[1];
+
+    m = text.match(/^\s*([A-L])\s*[\.\)\:\-]/m);
+    if (m && labels.indexOf(m[1]) >= 0) return m[1];
+
+    const all = text.match(/\b([A-L])\b/g) || [];
+    for (const a of all) {
+      const c = a.replace(/[^A-L]/g, "");
+      if (labels.indexOf(c) >= 0) return c;
+    }
+    return "";
+  }
+
+  function parseAnswerObj(raw, labels) {
+    if (!raw) return null;
+    let text = String(raw).trim().replace(/```[a-zA-Z]*\n?/g, "").trim();
+
+    const mj = text.match(/\{[\s\S]*\}/);
+    if (mj) {
+      try {
+        const o = JSON.parse(mj[0]);
+        const a = o.answer != null ? o.answer
+          : o.dap_an != null ? o.dap_an
+          : o.dapAn != null ? o.dapAn
+          : o.choice != null ? o.choice
+          : o.result != null ? o.result
+          : o.key;
+        if (a != null) {
+          const L = normalizeLetter(a, labels);
+          if (L) {
+            const reason = String(o.reason || o.giai_thich || o.giaiThich || o.explain || "").trim();
+            return { letter: L, reason: reason.slice(0, 400) };
+          }
+        }
+      } catch (e) {}
+    }
+    const L = parseAnswerLetter(text, labels);
+    return L ? { letter: L, reason: text.slice(0, 400) } : null;
+  }
+
+  function parseFillAnswers(raw, n) {
+    const out = [];
+    if (!raw) return out;
+    const text = String(raw).replace(/```[a-zA-Z]*\n?/g, "").trim();
+
+    const mj = text.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+    if (mj) {
+      try {
+        const o = JSON.parse(mj[0]);
+        if (Array.isArray(o)) return o.map((x) => String(x).trim()).slice(0, n);
+        const arr = o.answers || o.dap_an || o.dapAn || o.blanks || o.result;
+        if (Array.isArray(arr)) return arr.map((x) => String(x).trim()).slice(0, n);
+        if (arr && typeof arr === "object") {
+          for (let i = 1; i <= n; i++) {
+            const v = arr[String(i)] != null ? arr[String(i)]
+              : arr["blank" + i] != null ? arr["blank" + i]
+              : arr["(" + i + ")"] != null ? arr["(" + i + ")"] : null;
+            if (v != null) out[i - 1] = String(v).trim();
+          }
+          if (out.filter(Boolean).length) return out;
+        }
+      } catch (e) {}
+    }
+
+    const lines = text.split(/\n+/).map((s) => s.trim()).filter(Boolean);
+    for (const ln of lines) {
+      const m = ln.match(/^\(?(\d{1,2})[\.\)\:\-]\s*(.+)$/);
+      if (m) {
+        const i = parseInt(m[1], 10) - 1;
+        if (i >= 0 && i < n) out[i] = m[2].replace(/^[\s\-–]+/, "").trim();
+      }
+    }
+    if (out.filter(Boolean).length) return out;
+
+    const parts = text.split(/[\n,;]+/).map((s) => s.replace(/^\s*\(?\d+[\.\)]\s*/, "").trim()).filter(Boolean);
+    return parts.slice(0, n);
+  }
+
+  /* ============================ DOM READ ============================ */
+  function qRoot() {
+    const direct = qs("#test-step-question");
+    if (direct) return direct;
+    const alt = qs("app-test-school-step-data-regular");
+    if (alt) return alt;
+    const alt2 = qs(".question-container");
+    if (alt2) return alt2;
+    return null;
+  }
+
+  function currentQuestionTitle() {
+    const el = qs("#test-step-question .question-header .num") || qs(".question-header .num");
+    if (!el) return "";
+    return (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 90);
+  }
+
+  function sigNow() {
+    const t = currentQuestionTitle();
+    const idm = t.match(/#(\d+)/);
+    if (idm) return idm[1];
+    const act = qs(".answer-sheet .option.active");
+    if (act) return "sheet:" + (act.textContent || "").trim();
+    const root = qRoot();
+    return t || (root ? (root.textContent || "").slice(0, 90) : "");
   }
 
   function isNoteArea(el) {
     if (!el || !el.closest) return false;
-    return !!(el.closest(".popupNoteV2") || el.closest("#test-step-questionnoteTextarea"));
-  }
-
-  function qRoot() {
-    return $("#test-step-question")
-        || $(".test-step-question")
-        || $("app-test-school-step-data-regular .question-container")
-        || $("app-test-school-step-data-regular")
-        || null;
-  }
-
-  function qRootDiag() {
-    const tries = ["#test-step-question", ".test-step-question",
-                   ".question-container", "app-test-school-step-data-regular"];
-    return tries.map((s) => s + "=" + ($(s) ? "✓" : "✗")).join(" ");
-  }
-
-  // ---- OPTIONS ----
-  function getOptions() {
-    const root = qRoot();
-    if (!root) return [];
-    const ex = (el) => !insideGui(el) && !el.closest(".answer-sheet") && isVisible(el);
-    const sizeOk = (a) => a.length >= 2 && a.length <= MAX_OPTIONS;
-
-    let opts = $$("div.question-option", root).filter(ex);
-    if (sizeOk(opts)) return opts.slice(0, MAX_OPTIONS);
-
-    opts = $$(".select-item", root).filter((el) =>
-      !insideGui(el) && !el.closest(".answer-sheet") && isVisible(el) &&
-      el.querySelector('input[type="radio"], input[type="checkbox"]')
-    );
-    if (sizeOk(opts)) {
-      log("[getOptions] type=.select-item ×" + opts.length);
-      return opts;
-    }
-
-    const classSels = [
-      '[class*="question-option"]','[class*="answer-option"]',
-      '[class*="choice-item"]','[class*="option-item"]',
-      '[class*="answer-item"]','[class*="choice"]','.choice','.option',
-    ];
-    for (let i = 0; i < classSels.length; i++) {
-      opts = $$(classSels[i], root).filter(ex).filter((el) => {
-        const t = (el.textContent || "").trim();
-        return t && t.length < 400;
-      });
-      if (sizeOk(opts)) {
-        log("[getOptions] type=" + classSels[i] + " ×" + opts.length);
-        return opts;
-      }
-    }
-
-    opts = $$("label", root).filter((l) =>
-      l.querySelector('input[type="radio"], input[type="checkbox"]') && ex(l)
-    );
-    if (sizeOk(opts)) {
-      log("[getOptions] type=label-wrap ×" + opts.length);
-      return opts;
-    }
-
-    const rad = $$('input[type="radio"], input[type="checkbox"]', root).filter((i) =>
-      !insideGui(i) && !i.closest(".answer-sheet") && !isNoteArea(i) &&
-      i.getClientRects().length > 0
-    );
-    if (sizeOk(rad)) {
-      const wrapped = rad.map((i) =>
-        i.closest(".select-item") || i.closest("label") ||
-        i.closest('[class*="option"]') || i.closest('[class*="item"]') || i.parentElement
-      );
-      log("[getOptions] type=raw-radio ×" + wrapped.length);
-      return wrapped;
-    }
-
-    return [];
-  }
-
-  function getFillInputs() {
-    const root = qRoot();
-    if (!root) return [];
-    return $$('input[type="text"], input:not([type]), [contenteditable="true"]', root).filter((el) =>
-      !insideGui(el) && !isNoteArea(el) && !el.disabled && !el.readOnly &&
-      !el.closest(".answer-sheet") && isVisible(el)
-    );
-  }
-
-  function getEssayTextareas() {
-    const root = qRoot();
-    if (!root) return [];
-    return $$("textarea", root).filter((el) =>
-      !insideGui(el) && !el.disabled && !el.readOnly && !isNoteArea(el) &&
-      el.id !== "test-step-questiontextarea" && isVisible(el)
-    );
-  }
-
-  function getStemText() {
-    const host = $("#test-step-question .question-name") || $(".question-name");
-    const ctx  = $("#test-step-question .question-text") || $(".question-text");
-    let a = "";
-    if (host) {
-      const clone = host.cloneNode(true);
-      const sel = clone.querySelector(".list-selection");
-      if (sel && sel.parentNode) sel.parentNode.removeChild(sel);
-      a = (clone.innerText || clone.textContent || "");
-    }
-    const b = ctx ? (ctx.innerText || ctx.textContent || "") : "";
-    return (a + "\n" + b).replace(/\n{3,}/g, "\n\n").trim().slice(0, 4500);
-  }
-
-  function getTargetBlankNumber() {
-    const title = $("#test-step-question .question-name .title");
-    if (!title) return "";
-    const m = (title.textContent || "").match(/Blank numbered\s*\((\d+)\)/i);
-    return m ? m[1] : "";
-  }
-
-  function stemWithBlanks(inputs) {
-    const host = $("#test-step-question .question-name") || $(".question-name");
-    if (!host) return getStemText();
-    const clone = host.cloneNode(true);
-    const cloneInputs = $$('input[type="text"], input:not([type]), [contenteditable="true"]', clone)
-      .filter((el) => !isNoteArea(el) && !el.disabled && !el.readOnly);
-    cloneInputs.forEach((inp, i) => {
-      const sp = document.createElement("span");
-      sp.textContent = " [___" + (i + 1) + "___] ";
-      if (inp.parentNode) inp.parentNode.replaceChild(sp, inp);
-    });
-    return (clone.innerText || clone.textContent || "").replace(/\s+/g, " ").trim().slice(0, 4000);
-  }
-
-  // ---- IMAGES ----
-  function isImageSrc(src) {
-    if (!src) return false;
-    return /^data:image\//i.test(src) || /^https?:\/\//i.test(src);
-  }
-
-  function optionImageUrl(opt) {
-    if (!opt) return "";
-    const c = opt.querySelector(".question-option-content") || opt;
-    const imgs = Array.from(c.querySelectorAll("img"));
-    for (let i = 0; i < imgs.length; i++) {
-      const src = imgs[i].getAttribute("src") || imgs[i].src || "";
-      if (isImageSrc(src)) return src;
-    }
-    return "";
-  }
-
-  function stemImages() {
-    const hosts = [];
-    const qn = $("#test-step-question .question-name");
-    const qt = $("#test-step-question .question-text");
-    if (qn) hosts.push(qn);
-    if (qt) hosts.push(qt);
-    const out = [];
-    const seen = {};
-    hosts.forEach((h) => {
-      h.querySelectorAll("img").forEach((im) => {
-        const src = im.getAttribute("src") || im.src || "";
-        if (isImageSrc(src) && !seen[src]) { seen[src] = 1; out.push(src); }
-      });
-    });
-    return out;
-  }
-
-  function optionLabel(opt) {
-    const l = $(".question-option-label", opt);
-    if (l) return (l.textContent || "").trim().toUpperCase();
-    const n = $(".number-item", opt);
-    if (n) return (n.textContent || "").trim().toUpperCase();
-    const t = (opt.textContent || "").trim();
-    const m = t.match(/^([A-Da-d])[\.\)\:]\s*/);
-    return m ? m[1].toUpperCase() : "";
-  }
-  function optionText(opt) {
-    const c = $(".question-option-content", opt);
-    if (c) {
-      const t = (c.innerText || c.textContent || "").trim();
-      if (t) return t;
-    }
-    const lb = opt.querySelector("label");
-    if (lb && (lb.textContent || "").trim()) return (lb.textContent || "").trim();
-    const t = (opt.textContent || "").trim();
-    return t.replace(/^[A-Da-d][\.\)\:]\s*/, "").trim();
-  }
-
-  function currentSignature() {
-    const num = $("#test-step-question .question-header .num") || $(".question-header .num");
-    const id  = num ? (num.textContent || "").trim().replace(/\s+/g, " ") : "";
-    const st  = getStemText().slice(0, 80);
-    return id + "|" + st;
-  }
-
-  function isSelected(opt) {
-    const cls = (opt.className || "").toLowerCase();
-    if (/(selected|checked|active|highlighted|chosen)/.test(cls)) return true;
-    if (opt.getAttribute("aria-checked") === "true") return true;
-    if (opt.getAttribute("aria-selected") === "true") return true;
-    const inp = opt.querySelector('input[type="checkbox"], input[type="radio"]');
-    if (inp && (inp.checked || inp.getAttribute("aria-checked") === "true")) return true;
+    if (el.closest(".popupNoteV2")) return true;
+    if (el.closest("#test-step-questionnoteTextarea")) return true;
+    if (el.id === "test-step-questiontextarea") return true;
+    const ph = (el.getAttribute("placeholder") || "").toLowerCase();
+    if (ph === "comment...") return true;
     return false;
   }
 
-  /* ================= TRANSPORT ================= */
-  function extractContent(text) {
-    let j = null;
-    try { j = JSON.parse(text); } catch (e) {}
-    if (j && typeof j === "object") {
-      if (j.error) return "";
-      const c = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
-      if (typeof c === "string" && c.trim()) return c.trim();
-      if (Array.isArray(c)) {
-        const joined = c.map((p) => {
-          if (typeof p === "string") return p;
-          if (p && typeof p.text === "string") return p.text;
-          return "";
-        }).filter(Boolean).join("\n").trim();
-        if (joined) return joined;
-      }
-      return "";
+  function getOptions() {
+    const root = qRoot() || document;
+    let list = [];
+    let type = "";
+
+    list = qsa("div.question-option", root).filter(visible);
+    if (list.length >= 2 && list.length <= MAX_OPTIONS) type = "div.question-option";
+
+    if (!list.length) {
+      const sel = qsa(".select-item", root).filter((el) => visible(el) || el.querySelector('input[type="radio"],input[type="checkbox"]'));
+      if (sel.length >= 2 && sel.length <= MAX_OPTIONS) { list = sel; type = ".select-item"; }
     }
-    if (typeof text === "string" && text.trim() && text.trim()[0] !== "{") return text.trim();
-    return "";
-  }
 
-  function extractError(text) {
-    try {
-      const j = JSON.parse(text);
-      if (j && j.error) {
-        if (typeof j.error === "string") return j.error.slice(0, 160);
-        return JSON.stringify(j.error).slice(0, 160);
+    if (!list.length) {
+      const variants = ['[class*="question-option"]', '[class*="answer-option"]', '[class*="choice-item"]',
+        '[class*="option-item"]', '[class*="answer-item"]', '[class*="choice"]'];
+      for (const sel of variants) {
+        const arr = qsa(sel, root).filter(visible);
+        if (arr.length >= 2 && arr.length <= MAX_OPTIONS) { list = arr; type = sel; break; }
       }
-    } catch (e) {}
-    return "";
+    }
+
+    if (!list.length) {
+      const radios = qsa('input[type="radio"], input[type="checkbox"]', root)
+        .filter((el) => !insideGui(el) && !el.closest(".answer-sheet") && !el.closest(".list-selection-hidden"));
+      if (radios.length >= 2 && radios.length <= MAX_OPTIONS) {
+        list = radios.map((r) =>
+          r.closest(".select-item") || r.closest("label") || r.closest('[class*="option"]') ||
+          r.closest('[class*="item"]') || r.parentElement
+        ).filter(Boolean);
+        type = "raw-radio";
+      }
+    }
+
+    // Dedup + remove nested duplicates
+    const uniq = [];
+    for (const el of list) {
+      if (!el || !el.isConnected) continue;
+      if (uniq.some((u) => u === el || u.contains(el) || el.contains(u))) continue;
+      uniq.push(el);
+    }
+    // Re-check nesting: keep innermost among duplicates
+    const finalList = uniq.filter((el) => !uniq.some((o) => o !== el && el.contains(o)));
+
+    if (finalList.length < 2) return { list: [], type: "" };
+    if (type) log("[getOptions] type=" + type + " ×" + finalList.length);
+    return { list: finalList.slice(0, MAX_OPTIONS), type: type };
   }
 
-  async function fetchJSON(url, opts, ms) {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, ms);
-    try {
-      const res = await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
-      const text = await res.text();
-      return { ok: res.ok, status: res.status, text: text };
-    } catch (e) {
-      return { ok: false, error: "fetch:" + (e && e.message ? e.message : e) };
-    } finally { clearTimeout(t); }
+  function optionLabel(el, i) {
+    const lab = qs(".question-option-label", el) || qs(".number-item", el) || qs(".option-label", el);
+    if (lab) {
+      const t = (lab.textContent || "").trim();
+      const m = t.match(/[A-Za-z]/);
+      if (m) return m[0].toUpperCase();
+    }
+    const inp = el.querySelector ? el.querySelector('input[type="radio"], input[type="checkbox"]') : null;
+    if (inp) {
+      const v = (inp.value || "").trim();
+      if (/^[A-Za-z]$/.test(v)) return v.toUpperCase();
+      const idm = (inp.id || "").match(/-(\d+)$/);
+      if (idm) { /* fall through */ }
+    }
+    const txt = (el.textContent || "").trim();
+    const m2 = txt.match(/^([A-Za-z])[\.\)\:\s]/);
+    if (m2) return m2[1].toUpperCase();
+    return String.fromCharCode(65 + i);
   }
 
-  function gmRequest(url, body, ms) {
-    return new Promise((resolve) => {
-      if (typeof GM_xmlhttpRequest !== "function") return resolve({ ok: false, error: "no-gm" });
-      let settled = false;
-      const done = (v) => { if (!settled) { settled = true; clearTimeout(guard); resolve(v); } };
-      const guard = setTimeout(() => done({ ok: false, error: "gm-guard-timeout" }), ms + 6000);
-      try {
-        GM_xmlhttpRequest({
-          method: "POST",
-          url: url,
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + POLL_KEY,
-            "Accept": "application/json",
-          },
-          data: body,
-          timeout: ms,
-          onload:    (r) => done({ ok: r.status >= 200 && r.status < 300, status: r.status, text: r.responseText }),
-          onerror:   () => done({ ok: false, error: "gm-net" }),
-          ontimeout: () => done({ ok: false, error: "gm-timeout" }),
-          onabort:   () => done({ ok: false, error: "gm-abort" }),
-        });
-      } catch (e) { done({ ok: false, error: "gm-throw:" + e }); }
-    });
+  function optionText(el) {
+    const c = qs(".question-option-content", el) || qs(".select-item-text", el) || qs("label", el);
+    let t = ((c ? c.textContent : el.textContent) || "").replace(/\s+/g, " ").trim();
+    t = t.replace(/^[A-Za-z][\.\)\:]\s*/, "");
+    return t;
   }
 
-  function modelChain() {
-    const chosen = (localStorage.getItem(MODEL_CUSTOM_KEY) || "").trim()
-                || (localStorage.getItem(MODEL_KEY) || "").trim()
-                || DEFAULT_MODEL;
-    const working = (localStorage.getItem(MODEL_WORKING) || "").trim();
+  function isImageSrc(s) {
+    return typeof s === "string" && /^data:image\//i.test(s);
+  }
+
+  function optionImageUrl(el) {
+    const imgs = el.querySelectorAll ? el.querySelectorAll("img") : [];
+    for (const img of imgs) {
+      const src = img.getAttribute("src") || img.currentSrc || "";
+      if (isImageSrc(src)) return src;
+    }
+    const bg = (el.style && el.style.backgroundImage) || "";
+    const m = bg.match(/url\(["']?(data:image\/[^"')]+)["']?\)/);
+    return m ? m[1] : "";
+  }
+
+  function stemImages() {
+    const root = qRoot();
+    if (!root) return [];
+    const imgs = qsa(".question-name img, .question-text img, .fadein img", root);
     const out = [];
-    [chosen, working].concat(FALLBACK_MODELS).forEach((m) => {
-      if (m && out.indexOf(m) === -1) out.push(m);
-    });
+    for (const img of imgs) {
+      const src = img.getAttribute("src") || img.currentSrc || "";
+      if (isImageSrc(src)) out.push(src);
+    }
+    return out.slice(0, 4);
+  }
+
+  function imgBytes(src) {
+    const s = String(src || "");
+    const i = s.indexOf(",");
+    return Math.round(Math.max(0, s.length - i - 1) * 0.75);
+  }
+
+  function getStemText() {
+    const root = qRoot();
+    if (!root) return "";
+    const holder = qs(".question-name", root) || root;
+    let text = "";
+    try {
+      const clone = holder.cloneNode(true);
+      clone.querySelectorAll(".list-selection, .options, .question-option, .select-item, .row.text-left.options")
+        .forEach((e) => e.remove());
+      let n = 0;
+      clone.querySelectorAll("input, textarea, [contenteditable]").forEach((el) => {
+        if (isNoteArea(el)) return;
+        n++;
+        const span = document.createElement("span");
+        span.textContent = " [___" + n + "___] ";
+        if (el.parentNode) el.parentNode.replaceChild(span, el);
+      });
+      text = (clone.textContent || "").replace(/\s+/g, " ").trim();
+    } catch (e) {
+      text = (holder.textContent || "").replace(/\s+/g, " ").trim();
+    }
+
+    const extra = qs(".question-text", root);
+    if (extra) {
+      const t2 = (extra.textContent || "").replace(/\s+/g, " ").trim();
+      if (t2) text += "\n\n" + t2;
+    }
+    return text.slice(0, 4500);
+  }
+
+  function stemWithBlanks() {
+    const base = getStemText();
+    return base;
+  }
+
+  function getTargetBlankNumber() {
+    const root = qRoot();
+    if (!root) return 0;
+    const title = qs(".question-name .title", root);
+    const t = title ? (title.textContent || "") : "";
+    const m = t.match(/Blank numbered\s*\((\d+)\)/i);
+    if (m) return parseInt(m[1], 10);
+    return 0;
+  }
+
+  function getFillInputs() {
+    const root = qRoot() || document;
+    const raw = qsa('input[type="text"], input:not([type]), input[type="number"], input[type="search"], [contenteditable="true"]', root);
+    const out = [];
+    for (const el of raw) {
+      if (insideGui(el)) continue;
+      if (isNoteArea(el)) continue;
+      if (el.closest(".answer-sheet")) continue;
+      if (el.disabled || el.readOnly) continue;
+      const t = (el.getAttribute("type") || "").toLowerCase();
+      if (t === "hidden" || t === "radio" || t === "checkbox" || t === "file") continue;
+      if (!visible(el)) continue;
+      if (el.isContentEditable && el.tagName !== "DIV" && el.tagName !== "P") { /* keep */ }
+      out.push(el);
+    }
     return out;
   }
 
-  function setWorkingModel(m) {
-    try { if (localStorage.getItem(MODEL_WORKING) !== m) localStorage.setItem(MODEL_WORKING, m); } catch (e) {}
-  }
-
-  let rawLogCount = 0;
-
-  async function askAI(messages) {
-    const models = modelChain();
-    const deadline = Date.now() + ASK_BUDGET_MS;
-    let lastErr = "unknown";
-
-    for (let mi = 0; mi < models.length; mi++) {
-      if (Date.now() > deadline) { lastErr = "budget-exceeded"; break; }
-      const model = models[mi];
-
-      for (let attempt = 0; attempt < 3; attempt++) {
-        if (Date.now() > deadline) { lastErr = "budget-exceeded"; break; }
-        beat();
-
-        const payload = {
-          model: model,
-          messages: messages,
-          temperature: 0.2,
-          max_tokens: 800,
-          stream: false,
-        };
-        if (attempt === 0) { payload.private = true; payload.referrer = "onluyen-solver"; }
-
-        const body = JSON.stringify(payload);
-        const headers = {
-          "Content-Type": "application/json",
-          "Authorization": "Bearer " + POLL_KEY,
-          "Accept": "application/json",
-        };
-
-        let r = await fetchJSON(PROXY_URL, { method: "POST", headers: headers, body: body }, API_TIMEOUT);
-
-        if (!r || !r.ok || !r.text) {
-          beat();
-          const g = await gmRequest(PROXY_URL, body, API_TIMEOUT);
-          if (g && g.ok && g.text) r = g;
-          else if (g && g.error) lastErr = g.error;
-        }
-
-        if (r && r.ok && r.text) {
-          const errMsg = extractError(r.text);
-          if (errMsg) { lastErr = "API: " + errMsg; }
-          else {
-            const txt = extractContent(r.text);
-            if (txt) {
-              setWorkingModel(model);
-              log("AI (" + model + ") OK");
-              return { ok: true, text: txt, model: model };
-            }
-            lastErr = "empty";
-            if (rawLogCount < 4) {
-              rawLogCount++;
-              log("RAW rỗng [" + model + "]: " + (r.text || "").slice(0, 220));
-            }
-          }
-        } else if (r && r.error) { lastErr = r.error; }
-        else if (r && r.status) { lastErr = "HTTP " + r.status; }
-
-        log("↻ " + model + " lần " + (attempt + 1) + "/3 (lỗi: " + lastErr + ")");
-        await sleep(600);
-      }
+  function getEssayInput() {
+    const root = qRoot() || document;
+    const areas = qsa("textarea", root);
+    for (const el of areas) {
+      if (insideGui(el)) continue;
+      if (isNoteArea(el)) continue;
+      if (el.id === "test-step-questiontextarea") continue;
+      if (el.disabled || el.readOnly) continue;
+      if (!visible(el)) continue;
+      return el;
     }
-    return { ok: false, error: lastErr };
+    return null;
   }
 
-  async function askAIVision(parts) {
-    const deadline = Date.now() + VISION_BUDGET_MS;
-    let lastErr = "unknown";
-    const messages = [
-      { role: "system", content: "Bạn là giáo viên. Đọc kỹ đề bài và hình ảnh, chỉ trả về JSON ngắn gọn." },
-      { role: "user", content: parts },
-    ];
-
-    for (let mi = 0; mi < VISION_MODELS.length; mi++) {
-      if (Date.now() > deadline) { lastErr = "budget-exceeded"; break; }
-      const model = VISION_MODELS[mi];
-      beat();
-
-      const payload = {
-        model: model,
-        messages: messages,
-        temperature: 0.1,
-        max_tokens: 500,
-        stream: false,
-        private: true,
-        referrer: "onluyen-solver",
-      };
-      const body = JSON.stringify(payload);
-      const headers = {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer " + POLL_KEY,
-        "Accept": "application/json",
-      };
-
-      let r = await fetchJSON(PROXY_URL, { method: "POST", headers: headers, body: body }, VISION_TIMEOUT);
-
-      if (!r || !r.ok || !r.text) {
-        beat();
-        const g = await gmRequest(PROXY_URL, body, VISION_TIMEOUT);
-        if (g && g.ok && g.text) r = g;
-        else if (g && g.error) lastErr = g.error;
-      }
-
-      if (r && r.ok && r.text) {
-        const errMsg = extractError(r.text);
-        if (errMsg) { lastErr = "API: " + errMsg; }
-        else {
-          const txt = extractContent(r.text);
-          if (txt) {
-            log("👁 Vision (" + model + ") OK");
-            return { ok: true, text: txt, model: model };
-          }
-          lastErr = "empty";
-          if (rawLogCount < 5) {
-            rawLogCount++;
-            log("RAW vision [" + model + "]: " + (r.text || "").slice(0, 260));
-          }
-        }
-      } else if (r && r.error) { lastErr = r.error; }
-      else if (r && r.status) { lastErr = "HTTP " + r.status; }
-
-      log("↻ Vision " + model + " lỗi: " + lastErr);
-      await sleep(400);
-    }
-    return { ok: false, error: lastErr };
-  }
-
-  /* ================= PROMPTS ================= */
-  function buildMcqMessages(opts) {
-    const stem = getStemText();
-    const target = getTargetBlankNumber();
-    const hint = target
-      ? "\n\n[ĐÂY LÀ CÂU HỎI ĐIỀN VÀO CHỖ TRỐNG SỐ (" + target + ") TRONG ĐOẠN VĂN TRÊN]"
-      : "";
-    const lines = opts.slice(0, MAX_OPTIONS).map((o, i) => {
-      const lb = optionLabel(o) || String.fromCharCode(65 + i);
-      return lb + ". " + optionText(o);
-    });
-    return [
-      { role: "system", content: "Bạn là giáo viên giải bài tập. Chỉ trả về JSON ngắn gọn, không giải thích ngoài JSON." },
-      { role: "user", content:
-        "Câu hỏi:\n" + stem + hint + "\n\nCác đáp án:\n" + lines.join("\n") +
-        "\n\nHãy chọn đúng 1 đáp án đúng nhất. Trả về đúng định dạng:\n" +
-        '{"answer":"<chữ cái A/B/C/D>","explain":"<giải thích ngắn dưới 20 từ>"}'
-      },
-    ];
-  }
-
-  function buildVisionMcqParts(opts) {
-    const stem = getStemText();
-    const sImgs = stemImages();
-    const parts = [];
-
-    parts.push({ type: "text", text:
-      "Đây là câu hỏi trắc nghiệm tiếng Anh. Hãy đọc kỹ đề bài và TẤT CẢ các hình ảnh được gửi kèm, rồi chọn đáp án đúng nhất.\n\n" +
-      "ĐỀ BÀI:\n" + stem
-    });
-
-    sImgs.forEach((url, i) => {
-      parts.push({ type: "text", text: "\n[Hình " + (i + 1) + " trong đề bài — bảng số liệu/hình vẽ]" });
-      parts.push({ type: "image_url", image_url: { url: url } });
-    });
-
-    opts.forEach((opt, i) => {
-      const lb = optionLabel(opt) || String.fromCharCode(65 + i);
-      const img = optionImageUrl(opt);
-      const txt = optionText(opt);
-      if (img) {
-        parts.push({ type: "text", text: "\nĐÁP ÁN " + lb + " (hình ảnh đồ thị):" });
-        parts.push({ type: "image_url", image_url: { url: img } });
-      } else {
-        parts.push({ type: "text", text: "\nĐÁP ÁN " + lb + ": " + txt });
-      }
-    });
-
-    parts.push({ type: "text", text:
-      "\n\nHãy chọn đúng 1 đáp án đúng nhất. Trả về đúng định dạng JSON:\n" +
-      '{"answer":"<A/B/C/D>","explain":"<giải thích ngắn dưới 25 từ>"}'
-    });
-    return parts;
-  }
-
-  function buildFillMessages(stem, n) {
-    return [
-      { role: "system", content: "Bạn là giáo viên tiếng Anh. Chỉ trả về JSON, không giải thích ngoài JSON." },
-      { role: "user", content:
-        "Điền vào chỗ trống. Mỗi [___k___] là 1 ô cần điền. Có tất cả " + n + " ô.\n\n" + stem +
-        "\n\nTrả về đúng định dạng:\n" +
-        '{"answers":["<ô 1>","<ô 2>"]}\n' +
-        "Chỉ điền đúng dạng từ cần thiết (chia thì/dạng từ), không thêm giải thích."
-      },
-    ];
-  }
-
-  function buildEssayMessages(stem) {
-    return [
-      { role: "system", content: "Bạn là giáo viên. Trả lời NGẮN GỌN, chỉ đưa đáp án, không lan man." },
-      { role: "user", content:
-        "Câu hỏi:\n" + stem +
-        "\n\nTrả lời trực tiếp bằng nội dung cần điền/viết. Không mở đầu bằng 'Đáp án:', không thêm giải thích, không thêm bản dịch."
-      },
-    ];
-  }
-
-  function buildVerifyMessages(stem, chosenText) {
-    return [
-      { role: "system", content: "Bạn là người kiểm tra bài. Chỉ trả về JSON." },
-      { role: "user", content:
-        "Câu hỏi:\n" + stem + "\n\nĐáp án đang chọn: " + chosenText +
-        "\n\nĐáp án này đúng hay sai? Trả về đúng định dạng:\n" +
-        '{"ok":true|false,"answer":"<nếu sai thì đưa đáp án đúng, nếu đúng thì lặp lại đáp án>"}'
-      },
-    ];
-  }
-
-  /* ================= PARSING ================= */
-  function parseAnswerLetter(raw) {
-    const s = String(raw || "").trim();
-    let key = "";
-    try {
-      const m = s.match(/\{[\s\S]*\}/);
-      if (m) {
-        const o = JSON.parse(m[0]);
-        key = String(o.answer || o.correct || o.letter || o.choice || "").trim();
-      }
-    } catch (e) {}
-
-    const src = key || s;
-    const upper = src.toUpperCase();
-
-    if (/^[A-L]$/.test(upper)) return upper;
-    const m1 = upper.match(/^(?:OPTION\s*)?([A-L])[\s\.\)\:\-]/);
-    if (m1) return m1[1];
-    const m2 = upper.match(/\b([A-L])\b/);
-    if (m2) return m2[1];
-    return "";
-  }
-
-  function parseAnswerObj(raw, opts) {
-    const s = String(raw || "").trim();
-    let inlineKey = "";
-    let explain = "";
-    try {
-      const m = s.match(/\{[\s\S]*\}/);
-      if (m) {
-        const o = JSON.parse(m[0]);
-        inlineKey = String(o.answer || o.correct || o.letter || o.choice || "").trim();
-        explain = (o.explain || o.explanation) || "";
-      }
-    } catch (e) {}
-
-    if (inlineKey) {
-      const upper = inlineKey.toUpperCase();
-      for (let i = 0; i < opts.length; i++) {
-        if (optionLabel(opts[i]).toUpperCase() === upper) {
-          return { index: i, letter: optionLabel(opts[i]) || String.fromCharCode(65 + i), explain };
-        }
-      }
-      const lower = inlineKey.toLowerCase();
-      for (let i = 0; i < opts.length; i++) {
-        const t = optionText(opts[i]).toLowerCase();
-        if (t && t !== "." && (t === lower || t.indexOf(lower) >= 0 || lower.indexOf(t) >= 0)) {
-          return { index: i, letter: optionLabel(opts[i]) || String.fromCharCode(65 + i), explain };
-        }
-      }
-    }
-
-    const key = parseAnswerLetter(raw);
-    if (!key) return null;
-
-    let idx = -1;
-    for (let i = 0; i < opts.length; i++) {
-      const lb = optionLabel(opts[i]).toUpperCase();
-      if (lb && lb.indexOf(key[0]) === 0) { idx = i; break; }
-    }
-    if (idx < 0) idx = key.charCodeAt(0) - 65;
-    if (idx < 0 || idx >= opts.length) return null;
-
-    return { index: idx, letter: optionLabel(opts[idx]) || String.fromCharCode(65 + idx), explain };
-  }
-
-  function parseFillAnswers(raw, n) {
-    const s = String(raw || "").trim();
-    let arr = null;
-    try {
-      const m = s.match(/\{[\s\S]*\}/);
-      if (m) {
-        const o = JSON.parse(m[0]);
-        if (Array.isArray(o.answers)) arr = o.answers;
-        else if (Array.isArray(o.answer)) arr = o.answer;
-        else if (typeof o.answer === "string") arr = [o.answer];
-      }
-    } catch (e) {}
-    if (!arr) {
-      const m2 = s.match(/\[[\s\S]*\]/);
-      if (m2) { try { arr = JSON.parse(m2[0]); } catch (e) {} }
-    }
-    if (!arr) arr = s.split(/\s*\|\s*|\n+/);
-    arr = arr.map((x) => String(x == null ? "" : x).trim().replace(/^["'“”]|["'“”]$/g, ""));
-    while (arr.length < n) arr.push("");
-    return arr.slice(0, Math.max(n, 1));
-  }
-
-  function extractBareAnswer(raw) {
-    let s = String(raw || "").trim();
-    s = s.split(/\n(?:Câu đúng|Giải thích|Dịch|Correct answer|Explanation)\s*[:：]/i)[0];
-    s = s.replace(/^\s*(?:Đáp án|Answer|Trả lời)\s*[:：]\s*/i, "");
-    s = s.replace(/\s*\([^()]*[\u00C0-\u1EF9][^()]*\)\s*$/u, "");
-    s = s.replace(/^["'“”`]+|["'“”`]+$/g, "");
-    return s.trim();
-  }
-
-  /* ================= DOM ACTIONS ================= */
-  function typeInto(el, value) {
-    if (!el) return false;
-    if (el.isContentEditable) {
-      try { el.focus(); } catch (e) {}
-      el.textContent = value;
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      try { el.blur(); } catch (e) {}
-      return (el.textContent || "").trim() === String(value).trim();
-    }
-    const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    const desc = Object.getOwnPropertyDescriptor(proto, "value");
-    try { el.focus(); } catch (e) {}
-    if (desc && desc.set) desc.set.call(el, value);
-    else el.value = value;
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
-    el.dispatchEvent(new Event("blur", { bubbles: true }));
-    try { el.blur(); } catch (e) {}
-    return String(el.value) === String(value);
-  }
-
-  async function applyAnswer(idx) {
-    const opts = getOptions();
-    const opt = opts[idx];
-    if (!opt) return false;
-    if (isSelected(opt)) return true;
-    try { opt.scrollIntoView({ block: "center" }); } catch (e) {}
-    await sleep(80);
-    try { opt.click(); } catch (e) {}
-    const inp = opt.querySelector('input[type="checkbox"], input[type="radio"]');
-    if (inp && !inp.checked) {
-      try { inp.focus(); } catch (e) {}
-      try { inp.click(); } catch (e) {}
-      try { inp.checked = true; } catch (e) {}
-      try { inp.dispatchEvent(new Event("input", { bubbles: true })); } catch (e) {}
-      try { inp.dispatchEvent(new Event("change", { bubbles: true })); } catch (e) {}
-    }
-    await sleep(250);
-    if (isSelected(opt) || (inp && inp.checked)) return true;
-    await sleep(200);
-    try { opt.click(); } catch (e) {}
-    if (inp && !inp.checked) { try { inp.click(); } catch (e) {} }
-    await sleep(250);
-    return isSelected(opt) || (inp && inp.checked);
-  }
-
-  function submitBarButtons() {
-    const bar = $(".submit-bar");
-    if (!bar) return [];
-    return $$("button", bar).filter((b) => !insideGui(b));
-  }
   function submitBarTexts() {
-    return submitBarButtons().map((b) => (b.textContent || "").trim().toUpperCase());
+    const bars = qsa(".submit-bar, .question-submit, .btn-submit-answer");
+    const out = [];
+    for (const bar of bars) {
+      if (insideGui(bar)) continue;
+      const btns = qsa("button, a.btn", bar);
+      for (const b of btns) {
+        const t = (b.textContent || "").replace(/\s+/g, " ").trim();
+        if (t) out.push(t);
+      }
+    }
+    return out;
   }
+
   function logSubmitBar() {
     const t = submitBarTexts();
-    log("submit-bar: " + (t.length ? "[" + t.join("] [") + "]" : "(trống)"));
+    log("submit-bar: " + (t.length ? "[" + t.join(" | ") + "]" : "(trống)"));
   }
 
-  async function findNewAnswerButton(before) {
-    for (let i = 0; i < 12; i++) {
-      const btns = submitBarButtons();
-      for (let j = 0; j < btns.length; j++) {
-        const b = btns[j];
-        const t = (b.textContent || "").trim();
-        if (!t) continue;
-        if (BAD_BTN_RE.test(t)) continue;
-        if (ANSWER_BTN_RE.test(t)) return b;
-        if (before.indexOf(t.toUpperCase()) === -1) return b;
+  function isFinished() {
+    const opts = qsa(".answer-sheet .option");
+    if (opts.length && opts.every((o) => o.classList.contains("done"))) return true;
+    return false;
+  }
+
+  /* ============================ ACTIONS ============================ */
+  function singleClick(el) {
+    if (!el) return;
+    try {
+      const r = el.getBoundingClientRect();
+      const x = r.left + r.width / 2;
+      const y = r.top + r.height / 2;
+      const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
+      el.dispatchEvent(new PointerEvent("pointerdown", opts));
+      el.dispatchEvent(new MouseEvent("mousedown", opts));
+      el.dispatchEvent(new PointerEvent("pointerup", opts));
+      el.dispatchEvent(new MouseEvent("mouseup", opts));
+      el.dispatchEvent(new MouseEvent("click", opts));
+    } catch (e) {
+      try { el.click(); return; } catch (e2) { return; }
+    }
+    try { el.click(); } catch (e) {}
+  }
+
+  function isSelected(el) {
+    if (!el) return false;
+    const inp = el.matches && el.matches("input") ? el : (el.querySelector ? el.querySelector('input[type="radio"], input[type="checkbox"]') : null);
+    if (inp && inp.checked) return true;
+    const cls = typeof el.className === "string" ? el.className : "";
+    if (/\b(selected|checked|active|highlighted|chosen)\b/.test(cls)) return true;
+    if (el.getAttribute && (el.getAttribute("aria-checked") === "true" || el.getAttribute("aria-selected") === "true")) return true;
+    return false;
+  }
+
+  async function applyAnswer(opt) {
+    if (!opt) return false;
+    if (isSelected(opt)) return true;
+
+    try { opt.scrollIntoView({ block: "center" }); } catch (e) {}
+    await sleep(100);
+
+    const target = (opt.matches && opt.matches("input"))
+      ? (opt.closest(".select-item") || opt.closest("label") || opt)
+      : opt;
+
+    singleClick(target);
+    await sleep(220);
+    if (isSelected(opt)) return true;
+
+    const inp = (opt.matches && opt.matches("input")) ? opt : (opt.querySelector ? opt.querySelector('input[type="radio"], input[type="checkbox"]') : null);
+    if (inp) {
+      try { inp.checked = true; } catch (e) {}
+      singleClick(inp);
+      try {
+        inp.dispatchEvent(new Event("input", { bubbles: true }));
+        inp.dispatchEvent(new Event("change", { bubbles: true }));
+      } catch (e) {}
+      await sleep(220);
+      if (isSelected(opt)) return true;
+    }
+
+    const lab = opt.querySelector ? opt.querySelector("label[for]") : null;
+    if (lab) {
+      singleClick(lab);
+      await sleep(220);
+      if (isSelected(opt)) return true;
+    }
+    return isSelected(opt);
+  }
+
+  function nativeSet(el, val) {
+    try {
+      if (el.isContentEditable) {
+        el.textContent = val;
+        el.dispatchEvent(new InputEvent("input", { bubbles: true, data: val }));
+        return true;
       }
-      await sleep(250);
+      const proto = (el.tagName === "TEXTAREA") ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const desc = Object.getOwnPropertyDescriptor(proto, "value");
+      if (desc && desc.set) desc.set.call(el, val);
+      else el.value = val;
+      return true;
+    } catch (e) {
+      try { el.value = val; return true; } catch (e2) { return false; }
+    }
+  }
+
+  async function typeInto(el, value) {
+    if (!el || value == null) return false;
+    const val = String(value);
+    try { el.focus(); } catch (e) {}
+    try { el.click(); } catch (e) {}
+    nativeSet(el, "");
+    try {
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    } catch (e) {}
+    await sleep(60);
+    nativeSet(el, val);
+    try {
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      el.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: val.slice(-1) }));
+      el.dispatchEvent(new Event("blur", { bubbles: true }));
+    } catch (e) {}
+    await sleep(120);
+    const cur = String(el.value != null ? el.value : el.textContent || "");
+    return cur.trim() === val.trim();
+  }
+
+  function findAnswerButton() {
+    const candidates = [];
+
+    for (const bar of qsa(".submit-bar, .question-submit, .btn-submit-answer, .submit-bar.container-fluid")) {
+      if (insideGui(bar)) continue;
+      for (const b of qsa("button, a.btn", bar)) candidates.push(b);
+    }
+    for (const b of qsa("button, a.btn, .btn")) {
+      if (insideGui(b)) continue;
+      if (b.closest(".answer-sheet")) continue;
+      if (b.closest(".report-error")) continue;
+      const t = (b.textContent || "").replace(/\s+/g, " ").trim();
+      if (!t || t.length > 40) continue;
+      if (BAD_BTN_RE.test(t)) continue;
+      if (!ANSWER_BTN_RE.test(t)) continue;
+      candidates.push(b);
+    }
+
+    const seen = new Set();
+    const scored = [];
+    for (const b of candidates) {
+      if (seen.has(b)) continue;
+      seen.add(b);
+      if (!b.isConnected) continue;
+      if (b.disabled) continue;
+      if (!visible(b)) continue;
+      const t = (b.textContent || "").replace(/\s+/g, " ").trim();
+      if (BAD_BTN_RE.test(t)) continue;
+      let score = 0;
+      if (/trả lời/i.test(t)) score += 100;
+      else if (ANSWER_BTN_RE.test(t)) score += 50;
+      if (b.closest(".submit-bar")) score += 10;
+      scored.push({ b: b, score: score });
+    }
+    scored.sort((a, b2) => b2.score - a.score);
+    return scored.length ? scored[0].b : null;
+  }
+
+  function findNextButton() {
+    for (const b of qsa("button, a.btn, .btn")) {
+      if (insideGui(b)) continue;
+      if (b.closest(".answer-sheet")) continue;
+      const t = (b.textContent || "").replace(/\s+/g, " ").trim();
+      if (!t || t.length > 40) continue;
+      if (BAD_BTN_RE.test(t)) continue;
+      if (!NEXT_RE.test(t)) continue;
+      if (!visible(b)) continue;
+      return b;
+    }
+    for (const b of qsa(".mobile-bottom-bar button, .nav-btn, button")) {
+      if (insideGui(b)) continue;
+      if (!b.querySelector(".fa-chevron-right, .fa-angle-right, .fa-arrow-right, .fa-forward")) continue;
+      if (!visible(b)) continue;
+      return b;
     }
     return null;
   }
 
   function clickSheetNext() {
-    const opts = $$(".answer-sheet .option").filter((o) => !insideGui(o));
+    const opts = qsa(".answer-sheet .option");
     if (!opts.length) return false;
     let idx = opts.findIndex((o) => o.classList.contains("active"));
-    if (idx < 0) {
-      idx = opts.findIndex((o) => !o.classList.contains("done"));
-      if (idx < 0) return false;
-      opts[idx].click();
+    if (idx < 0) idx = opts.findIndex((o) => !o.classList.contains("done"));
+    if (idx >= 0 && idx + 1 < opts.length) {
+      singleClick(opts[idx + 1]);
       return true;
     }
-    const next = opts[idx + 1];
-    if (next) { next.click(); return true; }
     return false;
+  }
+
+  async function waitAnswerButton(maxMs) {
+    const start = Date.now();
+    while (Date.now() - start < maxMs) {
+      const b = findAnswerButton();
+      if (b) return b;
+      await sleep(250);
+    }
+    return null;
   }
 
   async function advance() {
-    beat();
-    if (clickSheetNext()) { await sleep(1000); beat(); return true; }
-    const bar = $(".mobile-bottom-bar");
-    if (bar) {
-      const btns = $$("button.nav-btn", bar);
-      for (let i = 0; i < btns.length; i++) {
-        if (btns[i].querySelector(".fa-chevron-right")) {
-          btns[i].click(); await sleep(1000); beat(); return true;
-        }
-      }
+    const sig = sigNow();
+
+    const ans = await waitAnswerButton(2500);
+    if (ans) {
+      const txt = (ans.textContent || "").replace(/\s+/g, " ").trim();
+      singleClick(ans);
+      log('Bấm nút: "' + txt + '"');
+      await sleep(900);
+      if (sigNow() !== sig) { log("Trang tự chuyển câu."); return true; }
     }
-    const cands = $$("button, a.btn").filter((b) =>
-      !insideGui(b) && !b.closest(".submit-bar") && !b.closest(".submit-button") &&
-      !b.closest(".left-side") && !b.closest(".mobile-bottom-bar") && isVisible(b)
-    );
-    for (let i = 0; i < cands.length; i++) {
-      const t = (cands[i].textContent || "").trim();
-      if (!t || BAD_BTN_RE.test(t)) continue;
-      if (NEXT_RE.test(t)) { cands[i].click(); await sleep(1000); beat(); return true; }
+
+    if (clickSheetNext()) {
+      log("Chuyển câu bằng phiếu trả lời.");
+      await sleep(800);
+      if (sigNow() !== sig) return true;
     }
-    return false;
+
+    const nxt = findNextButton();
+    if (nxt) {
+      singleClick(nxt);
+      log("Bấm nút chuyển câu.");
+      await sleep(800);
+      if (sigNow() !== sig) return true;
+    }
+
+    return sigNow() !== sig;
   }
 
-  function hasQuestion() {
-    if (!qRoot()) return false;
-    if (getOptions().length) return true;
-    if (getFillInputs().length) return true;
-    if (getEssayTextareas().length) return true;
-    return false;
+  /* ============================ PROMPTS ============================ */
+  function buildMcqMessages(stem, items, blankN, prevLetter) {
+    const opts = items.map((o) => o.label + ". " + (o.text || "(nội dung là hình ảnh, không đọc được bằng text)")).join("\n");
+    let user = "";
+    if (blankN) user += "Đoạn văn dưới đây có các chỗ trống (1)…(n). Chọn đáp án đúng để điền vào CHỖ TRỐNG SỐ (" + blankN + ").\n\n";
+    user += "ĐỀ BÀI:\n" + stem + "\n\nCÁC LỰA CHỌN:\n" + opts + "\n\n";
+    user += 'Hãy chọn đúng 1 đáp án. Trả lời DUY NHẤT bằng JSON: {"answer":"<chữ cái>","reason":"<giải thích ngắn bằng tiếng Việt>"}';
+    if (prevLetter) user += '\nLần trước bạn đã chọn "' + prevLetter + '". Hãy KIỂM TRA LẠI THẬT KỸ. Nếu vẫn đúng thì giữ nguyên, nếu sai thì đổi.';
+
+    return [
+      { role: "system", content: "Bạn là giáo viên giỏi, giải đề chính xác, chỉ trả về JSON." },
+      { role: "user", content: user }
+    ];
   }
 
-  /* ================= STEPS ================= */
-  async function stepMcq(opts, myGen) {
-    if (!alive(myGen)) return;
-    const sig = currentSignature();
-    logSubmitBar();
-    log("Tìm thấy " + opts.length + " đáp án | " + sig.slice(0, 60));
-    const before = submitBarTexts();
-    const stem = getStemText();
-    const target = getTargetBlankNumber();
-    if (target) log("→ Đích: điền chỗ trống (" + target + ")");
+  function buildFillMessages(stem, count, targetBlank) {
+    let user = "";
+    if (targetBlank) user += "Chỉ cần trả lời cho CHỖ TRỐNG SỐ (" + targetBlank + ") trong đoạn văn.\n\n";
+    user += "ĐỀ BÀI (các ô trống được đánh dấu [___n___]):\n" + stem + "\n\n";
+    user += "Có tất cả " + count + " ô cần điền. Hãy điền từ/cụm từ/công thức còn thiếu.\n";
+    user += 'Trả lời DUY NHẤT bằng JSON: {"answers":["đáp án 1","đáp án 2", ...]} (đúng ' + count + ' phần tử).';
+    return [
+      { role: "system", content: "Bạn là giáo viên giỏi, giải đề điền từ chính xác, chỉ trả về JSON." },
+      { role: "user", content: user }
+    ];
+  }
 
-    // ---- image detection ----
-    const imgCount = opts.filter((o) => !!optionImageUrl(o)).length;
+  function buildEssayMessages(stem) {
+    const user = "ĐỀ BÀI:\n" + stem + "\n\nHãy viết câu trả lời/lời giải hoàn chỉnh, ngắn gọn, đúng trọng tâm. Không dùng markdown.";
+    return [
+      { role: "system", content: "Bạn là giáo viên giỏi, trả lời tự luận chính xác." },
+      { role: "user", content: user }
+    ];
+  }
+
+  function buildVisionMcqParts(stem, items, blankN, prevLetter) {
+    const content = [];
+    let head = "";
+    if (blankN) head += "Chọn đáp án đúng để điền vào CHỖ TRỐNG SỐ (" + blankN + ") trong đoạn văn.\n\n";
+    head += "ĐỀ BÀI (phần chữ):\n" + (stem || "(không có chữ)") + "\n\n";
     const sImgs = stemImages();
-    const visionOn = getVisionEnabled();
-    let useVision = false;
+    if (sImgs.length) head += "(Ảnh của đề bài được đính kèm bên dưới.)\n";
+    content.push({ type: "text", text: head });
 
-    if (visionOn) {
-      if (imgCount >= 2) useVision = true;
-      else if (imgCount === 0 && sImgs.length > 0) useVision = true;
+    for (const src of sImgs) content.push({ type: "image_url", image_url: { url: src } });
+
+    for (const o of items) {
+      content.push({ type: "text", text: "\n--- Đáp án " + o.label + " ---" });
+      if (o.img) content.push({ type: "image_url", image_url: { url: o.img } });
+      else content.push({ type: "text", text: o.text || "(trống)" });
     }
 
-    if (useVision) {
-      let totalSize = 0;
-      opts.forEach((o) => { const u = optionImageUrl(o); if (u) totalSize += u.length; });
-      sImgs.forEach((u) => { totalSize += u.length; });
-      if (totalSize > MAX_VISION_BYTES) {
-        log("⚠ Ảnh quá lớn (" + Math.round(totalSize / 1024) + "KB) — bỏ vision.");
-        useVision = false;
-      } else {
-        log("📷 Ảnh: " + imgCount + "/" + opts.length + " đáp án, " + sImgs.length +
-            " trong đề (" + Math.round(totalSize / 1024) + "KB) → vision.");
-      }
-    }
+    let tail = '\nHãy quan sát THẬT KỸ các hình ảnh (đồ thị, bảng số liệu, hình vẽ) và chọn đáp án đúng. Trả lời DUY NHẤT bằng JSON: {"answer":"<chữ cái>","reason":"<giải thích ngắn>"}';
+    if (prevLetter) tail += '\nLần trước bạn đã chọn "' + prevLetter + '". Kiểm tra lại thật kỹ, giữ nguyên nếu đúng, đổi nếu sai.';
+    content.push({ type: "text", text: tail });
 
-    let res = null;
-    let usedVision = false;
-    if (useVision) {
-      res = await askAIVision(buildVisionMcqParts(opts));
-      if (!alive(myGen)) return;
-      if (res.ok) usedVision = true;
-      else log("⚠ Vision lỗi (" + res.error + ") — thử AI chữ.");
-    }
-
-    if (!res || !res.ok) {
-      res = await askAI(buildMcqMessages(opts));
-      if (!alive(myGen)) return;
-      if (!res.ok) { log("❌ AI lỗi: " + res.error + " — thử lại sau 5s."); await sleep(5000); return; }
-    }
-
-    const pick = parseAnswerObj(res.text, opts);
-    if (!pick) {
-      log("❌ Không đọc được đáp án: " + res.text.slice(0, 120));
-      await sleep(3000);
-      return;
-    }
-
-    const optTxt = optionText(opts[pick.index]).trim();
-    const display = optTxt && optTxt !== "." ? optTxt.slice(0, 100) : "(hình ảnh)";
-    log("AI chọn " + pick.letter + ". " + display + " · " + (pick.explain || "").slice(0, 80));
-    showAnswer(pick.letter + ". " + display);
-
-    let ok = await applyAnswer(pick.index);
-    if (!alive(myGen)) return;
-    log(ok ? ("Đã tick " + pick.letter + ".") : ("⚠ Không tick được " + pick.letter + " — thử lại."));
-    if (!ok) ok = await applyAnswer(pick.index);
-
-    const verifyN = getVerifyCount();
-    if (usedVision && verifyN > 0) {
-      beat();
-      const parts2 = buildVisionMcqParts(opts);
-      parts2.push({ type: "text", text:
-        "\n\nLần đầu đã chọn đáp án " + pick.letter +
-        ". Hãy KIỂM TRA LẠI THẬT KỸ hình ảnh + đề bài. Nếu đúng, lặp lại đáp án đó; nếu sai, chọn lại đáp án đúng nhất. Trả JSON."
-      });
-      const vr = await askAIVision(parts2);
-      if (!alive(myGen)) return;
-      if (vr.ok) {
-        const np = parseAnswerObj(vr.text, opts);
-        if (np && np.index !== pick.index) {
-          log("↻ Vision kiểm tra đổi " + pick.letter + " → " + np.letter);
-          pick.index = np.index; pick.letter = np.letter;
-          await applyAnswer(pick.index);
-        } else if (np) {
-          log("✓ Vision kiểm tra giữ: " + pick.letter);
-        } else {
-          log("… Vision kiểm tra không đọc được, giữ nguyên.");
-        }
-      } else {
-        log("… Vision kiểm tra bỏ qua (" + vr.error + ")");
-      }
-    } else if (!usedVision && imgCount < 2) {
-      for (let v = 0; v < verifyN; v++) {
-        if (!alive(myGen)) return;
-        beat();
-        const chosen = optionLabel(opts[pick.index]) + ". " + optionText(opts[pick.index]);
-        const vr = await askAI(buildVerifyMessages(stem, chosen));
-        if (!alive(myGen)) return;
-        if (!vr.ok) { log("… kiểm tra " + (v + 1) + " bỏ qua (" + vr.error + ")"); continue; }
-        let needFix = false;
-        try {
-          const m = vr.text.match(/\{[\s\S]*\}/);
-          if (m) { const o = JSON.parse(m[0]); if (o && o.ok === false) needFix = true; }
-        } catch (e) {}
-        if (needFix) {
-          const np = parseAnswerObj(vr.text, opts);
-          if (np && np.index !== pick.index) {
-            log("↻ Kiểm tra sai — đổi sang " + np.letter);
-            pick.index = np.index; pick.letter = np.letter;
-            await applyAnswer(pick.index);
-            continue;
-          }
-        }
-        log("✓ Kiểm tra " + (v + 1) + " giữ: " + pick.letter);
-      }
-    } else if (imgCount >= 2 && !usedVision) {
-      log("… Bỏ kiểm tra (đáp án là hình, không có vision).");
-    }
-
-    const btn = await findNewAnswerButton(before);
-    if (!alive(myGen)) return;
-    if (btn) {
-      const t = (btn.textContent || "").trim();
-      btn.click();
-      log('Bấm nút: "' + t + '"');
-      await sleep(1300);
-      beat();
-    } else {
-      log("⚠ Không thấy nút Trả lời trong submit-bar.");
-    }
-
-    if (currentSignature() === sig) { await advance(); }
-    else { log("Trang tự chuyển câu."); await sleep(400); }
-    state.answered++;
-    setStatus("Đã làm " + state.answered + " câu");
+    return [
+      { role: "system", content: "Bạn là giáo viên giỏi, đọc và phân tích được hình ảnh, chỉ trả về JSON." },
+      { role: "user", content: content }
+    ];
   }
 
-  async function stepFill(inputs, myGen) {
-    if (!alive(myGen)) return;
-    const sig = currentSignature();
-    logSubmitBar();
-    log("Phát hiện " + inputs.length + " ô điền từ.");
-    const before = submitBarTexts();
-    const stem = stemWithBlanks(inputs);
+  /* ============================ SOLVE ============================ */
+  function shouldUseVision(items) {
+    if (!getVisionEnabled()) return false;
+    const imgCount = items.filter((o) => o.img).length;
+    const sImgs = stemImages();
+    let bytes = 0;
+    for (const o of items) if (o.img) bytes += imgBytes(o.img);
+    for (const s of sImgs) bytes += imgBytes(s);
 
-    const res = await askAI(buildFillMessages(stem, inputs.length));
-    if (!alive(myGen)) return;
-    if (!res.ok) { log("❌ AI lỗi: " + res.error + " — thử lại sau 5s."); await sleep(5000); return; }
+    if (imgCount >= 2) {
+      if (bytes > MAX_VISION_BYTES) { log("📷 Ảnh quá lớn (" + Math.round(bytes / 1024) + "KB) → bỏ vision."); return false; }
+      return true;
+    }
+    if (imgCount === 0 && sImgs.length > 0) {
+      if (bytes > MAX_VISION_BYTES) return false;
+      return true;
+    }
+    return false;
+  }
 
-    const answers = parseFillAnswers(res.text, inputs.length);
-    log("AI điền từ → " + answers.join(" | "));
+  async function solveMcq(stem, items, blankN, useVision, prevLetter) {
+    if (useVision) {
+      const parts = buildVisionMcqParts(stem, items, blankN, prevLetter);
+      const r = await askAIVision(parts, { budget: VISION_BUDGET_MS });
+      if (r.ok) {
+        const p = parseAnswerObj(r.text, items.map((o) => o.label));
+        if (p) return { letter: p.letter, reason: p.reason, model: r.model, via: "vision" };
+        log("⚠ Vision trả lời không đọc được → thử text.");
+      }
+    }
+    const msgs = buildMcqMessages(stem, items, blankN, prevLetter);
+    const r2 = await askAI(msgs, { budget: ASK_BUDGET_MS });
+    if (r2.ok) {
+      const p = parseAnswerObj(r2.text, items.map((o) => o.label));
+      if (p) return { letter: p.letter, reason: p.reason, model: r2.model, via: "text" };
+      log("⚠ AI trả lời không đọc được: " + r2.text.slice(0, 160));
+    }
+    return null;
+  }
+
+  async function stepMcq(opts, token) {
+    const sig = sigNow();
+    const title = currentQuestionTitle();
+    log("Tìm thấy " + opts.list.length + " đáp án | " + title);
+
+    const stem = getStemText();
+    const blankN = getTargetBlankNumber();
+    if (blankN) log("→ Đích: điền chỗ trống (" + blankN + ")");
+
+    const items = opts.list.map((el, i) => ({
+      el: el,
+      label: optionLabel(el, i),
+      text: optionText(el),
+      img: optionImageUrl(el)
+    }));
+
+    log("Đáp án: " + items.map((o) => o.label + (o.img ? "(ảnh)" : "") + ". " + (o.text || "").slice(0, 45)).join(" | "));
+
+    const useVision = shouldUseVision(items);
+    if (useVision) {
+      const nImg = items.filter((o) => o.img).length;
+      log("📷 Ảnh: " + nImg + "/" + items.length + " đáp án, " + stemImages().length + " trong đề → dùng vision.");
+    }
+
+    const first = await solveMcq(stem, items, blankN, useVision, "");
+    if (token !== genToken) return;
+    if (!first) { log("⚠ Không có đáp án — chuyển câu."); await advance(); return; }
+
+    let chosenLabel = first.letter;
+    let target = items.find((o) => o.label === chosenLabel);
+    if (!target) { log("⚠ Đáp án AI trả về không khớp lựa chọn (" + chosenLabel + ") — chuyển câu."); await advance(); return; }
+
+    log("AI chọn " + target.label + (target.text ? ". " + target.text.slice(0, 70) : ". (hình ảnh)") +
+      (first.reason ? ' · "' + first.reason.slice(0, 110) + '"' : ""));
+    showAnswer(target.label + ". " + (target.text || "(hình ảnh)"));
+
+    let ok = await applyAnswer(target.el);
+    if (token !== genToken) return;
+    log(ok ? "Đã tick " + target.label + "." : "⚠ Không tick được " + target.label + ".");
+
+    // ---- verify passes ----
+    const times = getVerifyTimes();
+    for (let i = 0; i < times; i++) {
+      if (token !== genToken) return;
+      const again = await solveMcq(stem, items, blankN, useVision, target.label);
+      if (!again) { log("… Kiểm tra " + (i + 1) + ": không gọi được AI — bỏ qua."); continue; }
+      if (again.letter === target.label) {
+        log("✓ Kiểm tra " + (i + 1) + " giữ: " + target.label);
+        continue;
+      }
+      const alt = items.find((o) => o.label === again.letter);
+      if (!alt) { log("… Kiểm tra " + (i + 1) + ": AI đổi sang " + again.letter + " nhưng không khớp — bỏ qua."); continue; }
+      log("↻ Kiểm tra " + (i + 1) + " đổi sang " + alt.label + " · " + (again.reason || "").slice(0, 100));
+      const ok2 = await applyAnswer(alt.el);
+      if (ok2) { target = alt; chosenLabel = alt.label; showAnswer(alt.label + ". " + (alt.text || "(hình ảnh)")); }
+    }
+
+    if (getRedo() && sig !== sigNow()) { /* nothing */ }
+
+    await advance();
+  }
+
+  async function stepFill(inputs, token) {
+    const sig = sigNow();
+    const title = currentQuestionTitle();
+    log("Tìm thấy " + inputs.length + " ô điền | " + title);
+
+    const stem = stemWithBlanks();
+    const blankN = getTargetBlankNumber();
+    const msgs = buildFillMessages(stem, inputs.length, blankN);
+    const r = await askAI(msgs, { budget: ASK_BUDGET_MS });
+    if (token !== genToken) return;
+    if (!r.ok) { log("⚠ AI lỗi — chuyển câu."); await advance(); return; }
+
+    const answers = parseFillAnswers(r.text, inputs.length);
+    log("AI điền: " + JSON.stringify(answers));
 
     let filled = 0;
     for (let i = 0; i < inputs.length; i++) {
-      const v = (answers[i] || "").trim();
-      if (!v) continue;
-      if (typeInto(inputs[i], v)) filled++;
-      await sleep(120);
+      const val = answers[i];
+      if (!val) continue;
+      const ok = await typeInto(inputs[i], val);
+      if (ok) filled++;
     }
     log("Đã điền " + filled + "/" + inputs.length + " ô.");
-    showAnswer(answers.filter(Boolean).join(" | "));
 
-    if (!filled) { log("⚠ Không điền được ô nào — chuyển câu."); await advance(); return; }
-
-    const btn = await findNewAnswerButton(before);
-    if (!alive(myGen)) return;
-    if (btn) {
-      const t = (btn.textContent || "").trim();
-      btn.click();
-      log('Bấm nút: "' + t + '"');
-      await sleep(1300); beat();
-    } else {
-      log("⚠ Không thấy nút Trả lời trong submit-bar.");
-    }
-
-    if (currentSignature() === sig) { await advance(); }
-    else { log("Trang tự chuyển câu."); await sleep(400); }
-    state.answered++;
-    setStatus("Đã làm " + state.answered + " câu");
+    if (filled === 0) { log("⚠ Không điền được ô nào — chuyển câu."); await advance(); return; }
+    await sleep(250);
+    if (sig === sigNow()) await advance();
+    else log("Trang tự chuyển câu.");
   }
 
-  async function stepEssay(areas, myGen) {
-    if (!alive(myGen)) return;
-    const sig = currentSignature();
-    logSubmitBar();
-    log("Phát hiện " + areas.length + " ô tự luận.");
-    const before = submitBarTexts();
+  async function stepEssay(input, token) {
+    const sig = sigNow();
+    log("Tìm thấy ô tự luận | " + currentQuestionTitle());
     const stem = getStemText();
+    const msgs = buildEssayMessages(stem);
+    const r = await askAI(msgs, { budget: ASK_BUDGET_MS });
+    if (token !== genToken) return;
+    if (!r.ok) { log("⚠ AI lỗi — chuyển câu."); await advance(); return; }
 
-    const res = await askAI(buildEssayMessages(stem));
-    if (!alive(myGen)) return;
-    if (!res.ok) { log("❌ AI lỗi: " + res.error + " — thử lại sau 5s."); await sleep(5000); return; }
+    let text = String(r.text || "").trim();
+    text = text.replace(/^(Đáp án|Trả lời|Answer)\s*[:\-]\s*/i, "").trim();
+    const ok = await typeInto(input, text);
+    log(ok ? "Đã điền tự luận (" + text.length + " ký tự)." : "⚠ Không điền được tự luận.");
 
-    const bare = extractBareAnswer(res.text);
-    if (!bare) { log("❌ AI trả về rỗng."); await sleep(3000); return; }
-    log("AI tự luận → " + bare.slice(0, 120));
-    showAnswer(bare.slice(0, 200));
+    if (sig === sigNow()) await advance();
+    else log("Trang tự chuyển câu.");
+  }
 
-    const area = areas[0];
-    const ok = typeInto(area, bare);
-    log(ok ? ("Đã điền tự luận (" + bare.length + " ký tự).") : "⚠ Không điền được tự luận.");
+  /* ============================ LOOP ============================ */
+  async function tick(token) {
+    const root = qRoot();
+    if (!root) { log("Chưa thấy câu hỏi… chờ trang render."); await sleep(1200); return; }
 
-    const btn = await findNewAnswerButton(before);
-    if (!alive(myGen)) return;
-    if (btn) {
-      const t = (btn.textContent || "").trim();
-      btn.click();
-      log('Bấm nút: "' + t + '"');
-      await sleep(1300); beat();
-    } else {
-      log("⚠ Không thấy nút Trả lời/Lưu cho tự luận.");
+    log("———————————————");
+    logSubmitBar();
+
+    if (isFinished()) {
+      log("🎉 Đã làm hết các câu.");
+      if (getAutoSubmit()) {
+        const btn = qs(".submit-button button") || qs(".submit-button .btn");
+        if (btn && visible(btn)) { singleClick(btn); log("Đã bấm Nộp Bài."); }
+      }
+      stop();
+      return;
     }
 
-    if (currentSignature() === sig) { await advance(); }
-    else { log("Trang tự chuyển câu."); await sleep(400); }
-    state.answered++;
-    setStatus("Đã làm " + state.answered + " câu");
+    const opts = getOptions();
+    if (opts.list.length >= 2) { await stepMcq(opts, token); return; }
+
+    const fills = getFillInputs();
+    if (fills.length) { await stepFill(fills, token); return; }
+
+    const essay = getEssayInput();
+    if (essay) { await stepEssay(essay, token); return; }
+
+    log("⚠ Không nhận diện được dạng câu — thử chuyển câu.");
+    await advance();
   }
 
-  /* ================= LOOP ================= */
-  function getInterval() {
-    const v = parseInt(localStorage.getItem(INTERVAL_KEY) || "2500", 10);
-    return isNaN(v) ? 2500 : Math.max(1200, v);
-  }
-  function getVerifyCount() {
-    const v = parseInt(localStorage.getItem(VERIFY_KEY) || "1", 10);
-    return isNaN(v) ? 1 : Math.max(0, Math.min(3, v));
-  }
-  function getVisionEnabled() {
-    return localStorage.getItem(VISION_KEY) !== "0";
+  async function sleepWithToken(ms, token) {
+    let left = ms;
+    while (left > 0 && running && token === genToken) {
+      const step = Math.min(250, left);
+      await sleep(step);
+      left -= step;
+    }
   }
 
   async function loop() {
-    const myGen = ++state.gen;
-    beat();
-    log("▶ Vòng lặp bắt đầu (gen " + myGen + ")");
+    if (running) return;
+    running = true;
+    const token = ++genToken;
+    setStatus("Đang chạy · " + getModel());
+    log("=== START · chọn: " + getModel() + " · dùng: " + (getWorkingModel() || "—") + " ===");
+    log("Model bị đánh dấu trả phí: " + (Array.from(getPaidSet()).join(", ") || "(không)"));
+    log("Vision: " + (getVisionEnabled() ? "ON" : "OFF") + " · Kiểm tra lại: " + getVerifyTimes() + " · Chu kỳ: " + getInterval() + "ms");
 
-    let noQ = 0;
-    while (state.running && myGen === state.gen) {
+    while (running && token === genToken) {
+      let timedOut = false;
+      const watchdog = new Promise((res) => {
+        setTimeout(() => { timedOut = true; res(); }, WATCHDOG_MS);
+      });
+
       try {
-        beat();
-        if (!hasQuestion()) {
-          noQ++;
-          if (noQ === 1 || noQ % 5 === 0) {
-            log("⏳ Chưa thấy input/option (" + noQ + "/20) · " + qRootDiag());
-          }
-          if (noQ === 3) log("💡 Q này lạ? Bấm 🔬 Dump HTML để gửi admin xem cấu trúc.");
-          if (noQ >= 20) {
-            log("⚠ 30s không nhận dạng được — thử chuyển câu.");
-            noQ = 0;
-            const moved = await advance();
-            if (!alive(myGen)) return;
-            if (!moved) {
-              log("❌ Không chuyển được câu — dừng. Bấm 🔬 Dump HTML gửi admin.");
-              state.running = false; setStatus("Trang không nhận dạng"); break;
-            }
-            await sleep(1500); continue;
-          }
-          await sleep(1500); continue;
-        }
-        noQ = 0;
-
-        const sig = currentSignature();
-        if (sig === state.lastSig) state.sameCount++;
-        else { state.lastSig = sig; state.sameCount = 0; }
-
-        if (state.sameCount >= 3) {
-          log("⚠ Kẹt câu này 3 lần — thử chuyển.");
-          state.sameCount = 0;
-          const moved = await advance();
-          if (!alive(myGen)) return;
-          if (!moved) { log("⚠ Không chuyển được — dừng."); state.running = false; setStatus("Không chuyển được"); break; }
-          await sleep(1200); continue;
-        }
-
-        const opts  = getOptions();
-        const fills = opts.length ? [] : getFillInputs();
-        const areas = (opts.length || fills.length) ? [] : getEssayTextareas();
-
-        if (opts.length)       await stepMcq(opts, myGen);
-        else if (fills.length) await stepFill(fills, myGen);
-        else if (areas.length) await stepEssay(areas, myGen);
-
-        if (!alive(myGen)) return;
-        await sleep(getInterval());
-      } catch (err) {
-        log("❌ Lỗi vòng lặp: " + (err && err.message ? err.message : String(err)));
-        await sleep(2000);
+        await Promise.race([tick(token), watchdog]);
+      } catch (e) {
+        log("❌ Lỗi vòng lặp: " + ((e && e.message) || e));
       }
-    }
-    log("■ Vòng lặp dừng (gen " + myGen + ")");
-  }
 
-  setInterval(() => {
-    if (!state.running) return;
-    const idle = Date.now() - state.lastBeat;
-    if (idle > WATCHDOG_MS) {
-      log("⚠ Không hoạt động " + Math.round(idle / 1000) + "s — tự khởi động lại vòng lặp.");
-      state.gen++;
-      state.lastBeat = Date.now();
-      setTimeout(() => { if (state.running) loop(); }, 300);
-    }
-  }, 5000);
+      if (!running || token !== genToken) break;
 
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) log("⚠ Tab bị ẩn — trình duyệt có thể tạm dừng script (giữ tab hiện).");
-    else { beat(); log("Tab hiện lại — tiếp tục."); }
-  });
-
-  /* ================= DIAGNOSTICS ================= */
-  function childTags(el, limit) {
-    if (!el) return "(không có)";
-    return Array.from(el.children).slice(0, limit || 12).map((k) => {
-      const tag = k.tagName.toLowerCase();
-      const id = k.id ? ("#" + k.id) : "";
-      const cls = (typeof k.className === "string" ? k.className : "").split(/\s+/).filter(Boolean).slice(0, 4).join(".");
-      return "<" + tag + id + (cls ? ("." + cls) : "") + ">";
-    }).join(" ");
-  }
-
-  function checkPage() {
-    log("=== KIỂM TRA TRANG ===");
-    log("URL: " + location.href);
-    ["#test-step-question",".test-step-question",".question-container",".question-name",
-     ".question-option",".select-item",".submit-bar",".answer-sheet",".question-text"].forEach((s) => {
-      const els = $$(s);
-      log("  " + s + ": " + (els.length ? ("×" + els.length) : "✗"));
-    });
-    log("  .question-name kids: " + childTags($(".question-name")));
-    log("  #test-step-question kids: " + childTags($("#test-step-question"), 8));
-
-    const opts = getOptions();
-    log("  Options (getOptions): " + opts.length + (opts.length ? " (" + opts.map((o) => optionLabel(o) + "=" + optionText(o).slice(0, 20)).join(" | ") + ")" : ""));
-
-    const optImgCount = opts.filter((o) => !!optionImageUrl(o)).length;
-    const sImgs = stemImages();
-    log("  Option images: " + optImgCount + "/" + opts.length + " · Stem images: " + sImgs.length + " · Vision ON: " + getVisionEnabled());
-
-    log("  Target blank: " + (getTargetBlankNumber() || "(không phải Blank-numbered)"));
-    log("  Fill inputs: " + getFillInputs().length);
-    log("  Essay textareas: " + getEssayTextareas().length);
-
-    const bar = submitBarTexts();
-    log("  Submit-bar: " + (bar.length ? "[" + bar.join("] [") + "]" : "(trống)"));
-    const sheet = $$(".answer-sheet .option");
-    const done = sheet.filter((o) => o.classList.contains("done")).length;
-    const aIdx = sheet.findIndex((o) => o.classList.contains("active"));
-    log("  Answer-sheet: " + sheet.length + " (done: " + done + ", active: #" + (aIdx >= 0 ? (aIdx + 1) : "?") + ")");
-
-    const stem = getStemText();
-    log("  Stem: " + (stem ? stem.slice(0, 160).replace(/\s+/g, " ") : "(trống)"));
-    log("======================");
-  }
-
-  async function testAI() {
-    log("=== TEST AI (text) ===");
-    const model = localStorage.getItem(MODEL_CUSTOM_KEY) || localStorage.getItem(MODEL_KEY) || DEFAULT_MODEL;
-    log("Model: " + model);
-    const body = JSON.stringify({
-      model: model,
-      messages: [{ role: "user", content: "Respond exactly with the word OK" }],
-      temperature: 0.1,
-      max_tokens: 20,
-      stream: false,
-    });
-    const headers = {
-      "Content-Type": "application/json",
-      "Authorization": "Bearer " + POLL_KEY,
-      "Accept": "application/json",
-    };
-    log("Gửi request...");
-    let r = await fetchJSON(PROXY_URL, { method: "POST", headers: headers, body: body }, API_TIMEOUT);
-    if (!r || !r.ok || !r.text) {
-      const g = await gmRequest(PROXY_URL, body, API_TIMEOUT);
-      if (g && (g.text || g.error)) r = g;
-    }
-    log("Status: " + (r && (r.status || r.error || "?")));
-    log("RAW: " + ((r && r.text) || "(rỗng)").slice(0, 320));
-    log("Extracted: " + ((r && r.text && extractContent(r.text)) || "(rỗng)"));
-    log("======================");
-
-    // Vision test if page has images
-    const opts = getOptions();
-    const sImgs = stemImages();
-    const anyImg = sImgs.length > 0 || opts.some((o) => !!optionImageUrl(o));
-    if (anyImg) {
-      log("=== TEST VISION ===");
-      const totalSize = sImgs.reduce((a, u) => a + u.length, 0) +
-                        opts.reduce((a, o) => a + (optionImageUrl(o) || "").length, 0);
-      log("Ảnh stem: " + sImgs.length + " · Ảnh options: " + opts.filter((o) => !!optionImageUrl(o)).length +
-          " · Tổng " + Math.round(totalSize / 1024) + "KB");
-      log("Models sẽ thử: " + VISION_MODELS.join(" → "));
-      const parts = buildVisionMcqParts(opts);
-      log("Số content parts: " + parts.length + " (image parts: " + parts.filter((p) => p.type === "image_url").length + ")");
-      log("Gửi request vision...");
-      const vres = await askAIVision(parts);
-      if (vres.ok) {
-        log("✅ Vision OK (" + vres.model + ")");
-        log("Extracted: " + vres.text.slice(0, 240));
-      } else {
-        log("❌ Vision fail: " + vres.error);
+      if (timedOut) {
+        log("⏱ Watchdog " + Math.round(WATCHDOG_MS / 1000) + "s — ép chuyển câu.");
+        try { await advance(); } catch (e) {}
       }
-      log("======================");
+
+      await sleepWithToken(getInterval(), token);
     }
-  }
 
-  function showHTMLModal(html) {
-    const overlay = document.createElement("div");
-    overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:2147483648;display:flex;flex-direction:column;padding:16px;gap:10px;font-family:system-ui;";
-    const title = document.createElement("div");
-    title.textContent = "HTML #test-step-question (" + html.length + " ký tự) — copy & gửi admin";
-    title.style.cssText = "color:#e2e8f0;font-size:13px;font-weight:600;";
-    const ta = document.createElement("textarea");
-    ta.value = html;
-    ta.readOnly = true;
-    ta.style.cssText = "flex:1;width:100%;font-family:monospace;font-size:11px;padding:10px;resize:none;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;";
-    const row = document.createElement("div");
-    row.style.cssText = "display:flex;gap:10px;";
-    const copyBtn = document.createElement("button");
-    copyBtn.textContent = "📋 Copy";
-    copyBtn.style.cssText = "flex:1;padding:12px;font-size:14px;font-weight:700;background:#16a34a;color:#fff;border:0;border-radius:8px;cursor:pointer;";
-    copyBtn.onclick = () => {
-      ta.focus(); ta.select();
-      try { copyBtn.textContent = document.execCommand("copy") ? "✅ Đã copy" : "⚠ Chọn tay"; }
-      catch (e) { copyBtn.textContent = "⚠ Chọn tay"; }
-    };
-    const closeBtn = document.createElement("button");
-    closeBtn.textContent = "❌ Đóng";
-    closeBtn.style.cssText = "flex:1;padding:12px;font-size:14px;font-weight:700;background:#dc2626;color:#fff;border:0;border-radius:8px;cursor:pointer;";
-    closeBtn.onclick = () => overlay.remove();
-    row.appendChild(copyBtn); row.appendChild(closeBtn);
-    overlay.appendChild(title); overlay.appendChild(ta); overlay.appendChild(row);
-    document.body.appendChild(overlay);
-    setTimeout(() => { try { ta.focus(); ta.select(); } catch (e) {} }, 100);
-  }
-
-  async function dumpHTML() {
-    const root = qRoot();
-    if (!root) { log("❌ Không tìm thấy container câu hỏi."); return; }
-    const full = root.outerHTML.replace(/\s+/g, " ").trim();
-    // Strip base64 to keep the dump small & readable
-    const html = full.replace(/data:image\/[a-zA-Z]+;base64,[A-Za-z0-9+/=]+/g, "data:image/BASE64_OMITTED");
-    log("📋 HTML length: " + html.length + " ký tự (base64 đã lược bỏ).");
-    try {
-      await navigator.clipboard.writeText(html);
-      log("✅ Đã copy HTML vào clipboard.");
-    } catch (e) {
-      log("⚠ Không tự copy được — mở hộp để copy tay.");
-    }
-    showHTMLModal(html);
-  }
-
-  /* ================= GUI ================= */
-  function buildGui() {
-    if (document.getElementById(GUI_ID)) return;
-
-    const style = document.createElement("style");
-    style.textContent = [
-      "#" + GUI_ID + "{position:fixed;top:12px;right:12px;width:340px;max-height:86vh;z-index:2147483647;",
-      "background:#0f172a;color:#e2e8f0;font:12px/1.45 system-ui,Segoe UI,Arial;border:1px solid #334155;",
-      "border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.45);display:flex;flex-direction:column;overflow:hidden}",
-      "#" + GUI_ID + " .ais-head{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;",
-      "background:#1e293b;cursor:move;user-select:none}",
-      "#" + GUI_ID + " .ais-title{font-weight:700;color:#38bdf8}",
-      "#" + GUI_ID + " .ais-head button{background:#334155;color:#e2e8f0;border:0;border-radius:6px;width:24px;height:22px;cursor:pointer}",
-      "#" + GUI_ID + " .ais-body{padding:8px 10px;overflow:auto;display:flex;flex-direction:column;gap:6px}",
-      "#" + GUI_ID + " .ais-row{display:flex;align-items:center;justify-content:space-between;gap:8px}",
-      "#" + GUI_ID + " .ais-row select,#" + GUI_ID + " .ais-row input{flex:1;min-width:0;background:#1e293b;color:#e2e8f0;",
-      "border:1px solid #334155;border-radius:6px;padding:4px 6px;font-size:12px}",
-      "#" + GUI_ID + " .ais-check{display:flex;align-items:center;gap:6px;font-size:11px;color:#cbd5e1}",
-      "#" + GUI_ID + " .ais-actions{display:flex;gap:6px;margin-top:2px}",
-      "#" + GUI_ID + " .ais-actions button{flex:1;padding:6px;border:0;border-radius:8px;cursor:pointer;font-weight:600;font-size:11px}",
-      "#" + GUI_ID + " .ais-start{background:#16a34a;color:#fff}",
-      "#" + GUI_ID + " .ais-stop{background:#dc2626;color:#fff}",
-      "#" + GUI_ID + " .ais-check-b{background:#2563eb;color:#fff}",
-      "#" + GUI_ID + " .ais-test-b{background:#9333ea;color:#fff}",
-      "#" + GUI_ID + " .ais-dump-b{background:#ea580c;color:#fff}",
-      "#" + GUI_ID + " .ais-status{color:#94a3b8;font-size:11px}",
-      "#" + GUI_ID + " .ais-answer{background:#052e16;border:1px solid #166534;color:#bbf7d0;border-radius:8px;",
-      "padding:6px;min-height:20px;word-break:break-word}",
-      "#" + GUI_ID + " .ais-log{background:#020617;border:1px solid #1e293b;border-radius:8px;padding:6px;",
-      "height:170px;overflow:auto;font:11px/1.4 ui-monospace,Consolas,monospace;color:#94a3b8;white-space:pre-wrap}",
-      "#" + GUI_ID + " .ais-foot{padding:6px 10px;background:#1e293b;color:#64748b;font-size:10px;text-align:center}",
-      "#" + GUI_ID + ".ais-collapsed .ais-body,#" + GUI_ID + ".ais-collapsed .ais-foot{display:none}",
-    ].join("");
-    document.head.appendChild(style);
-
-    const box = document.createElement("div");
-    box.id = GUI_ID;
-    box.innerHTML =
-      '<div class="ais-head"><span class="ais-title">⚡ ai slover v39.8</span>' +
-      '<button class="ais-min" title="Thu nhỏ">–</button></div>' +
-      '<div class="ais-body">' +
-        '<label class="ais-row">Model<select class="ais-model"></select></label>' +
-        '<label class="ais-row">Model khác<input class="ais-custom" type="text" placeholder="vd: openai"></label>' +
-        '<label class="ais-row">Chu kỳ (ms)<input class="ais-interval" type="number" min="1200" step="500"></label>' +
-        '<label class="ais-row">Kiểm tra lại<input class="ais-verify" type="number" min="0" max="3" step="1"></label>' +
-        '<label class="ais-check"><input class="ais-vision" type="checkbox" checked> 📷 Dùng AI đọc hình (vision)</label>' +
-        '<label class="ais-check"><input class="ais-redo" type="checkbox"> Làm lại câu đã đúng</label>' +
-        '<label class="ais-check"><input class="ais-autosubmit" type="checkbox"> Tự nộp bài khi hết câu (nguy hiểm)</label>' +
-        '<div class="ais-actions"><button class="ais-start">▶ Start</button><button class="ais-stop">■ Stop</button></div>' +
-        '<div class="ais-actions"><button class="ais-check-b">🔍 Check page</button><button class="ais-test-b">🧪 Test AI</button></div>' +
-        '<div class="ais-actions"><button class="ais-dump-b">🔬 Dump HTML</button></div>' +
-        '<div class="ais-status">Chưa chạy</div>' +
-        '<div class="ais-answer" id="ais-answer">—</div>' +
-        '<div class="ais-log" id="ais-log"></div>' +
-      '</div>' +
-      '<div class="ais-foot">v39.8 · Vision (đọc ảnh) · Blank-numbered · chống treo 60s</div>';
-
-    document.body.appendChild(box);
-
-    logEl    = $("#ais-log", box);
-    statusEl = $(".ais-status", box);
-    answerEl = $("#ais-answer", box);
-
-    const sel = $(".ais-model", box);
-    MODEL_CHOICES.forEach((m) => {
-      const o = document.createElement("option");
-      o.value = m; o.textContent = m;
-      sel.appendChild(o);
-    });
-    const savedModel = localStorage.getItem(MODEL_KEY) || DEFAULT_MODEL;
-    if (MODEL_CHOICES.indexOf(savedModel) === -1) {
-      const o = document.createElement("option");
-      o.value = savedModel; o.textContent = savedModel;
-      sel.appendChild(o);
-    }
-    sel.value = savedModel;
-    sel.addEventListener("change", () => {
-      localStorage.setItem(MODEL_KEY, sel.value);
-      localStorage.removeItem(MODEL_CUSTOM_KEY);
-      $(".ais-custom", box).value = "";
-      log("Đổi model: " + sel.value);
-    });
-
-    const custom = $(".ais-custom", box);
-    custom.value = localStorage.getItem(MODEL_CUSTOM_KEY) || "";
-    custom.addEventListener("change", () => {
-      const v = custom.value.trim();
-      if (v) { localStorage.setItem(MODEL_CUSTOM_KEY, v); log("Model khác: " + v); }
-      else { localStorage.removeItem(MODEL_CUSTOM_KEY); }
-    });
-
-    const intervalInp = $(".ais-interval", box);
-    intervalInp.value = localStorage.getItem(INTERVAL_KEY) || "2500";
-    intervalInp.addEventListener("change", () => {
-      const v = Math.max(1200, parseInt(intervalInp.value, 10) || 2500);
-      intervalInp.value = v;
-      localStorage.setItem(INTERVAL_KEY, String(v));
-    });
-
-    const verifyInp = $(".ais-verify", box);
-    verifyInp.value = localStorage.getItem(VERIFY_KEY) || "1";
-    verifyInp.addEventListener("change", () => {
-      const v = Math.max(0, Math.min(3, parseInt(verifyInp.value, 10) || 0));
-      verifyInp.value = v;
-      localStorage.setItem(VERIFY_KEY, String(v));
-    });
-
-    const visionChk = $(".ais-vision", box);
-    visionChk.checked = getVisionEnabled();
-    visionChk.addEventListener("change", () => {
-      localStorage.setItem(VISION_KEY, visionChk.checked ? "1" : "0");
-      log("Vision: " + (visionChk.checked ? "BẬT" : "TẮT"));
-    });
-
-    const redo = $(".ais-redo", box);
-    redo.checked = localStorage.getItem(REDO_KEY) !== "0";
-    redo.addEventListener("change", () => {
-      localStorage.setItem(REDO_KEY, redo.checked ? "1" : "0");
-    });
-
-    const auto = $(".ais-autosubmit", box);
-    auto.checked = localStorage.getItem(AUTOSUBMIT_KEY) === "1";
-    auto.addEventListener("change", () => {
-      localStorage.setItem(AUTOSUBMIT_KEY, auto.checked ? "1" : "0");
-      if (auto.checked) log("⚠ Đã bật tự nộp bài — cẩn thận!");
-    });
-
-    $(".ais-start", box).addEventListener("click", start);
-    $(".ais-stop", box).addEventListener("click", stop);
-    $(".ais-check-b", box).addEventListener("click", checkPage);
-    $(".ais-test-b", box).addEventListener("click", testAI);
-    $(".ais-dump-b", box).addEventListener("click", dumpHTML);
-    $(".ais-min", box).addEventListener("click", () => box.classList.toggle("ais-collapsed"));
-
-    const head = $(".ais-head", box);
-    let dragging = false, ox = 0, oy = 0;
-    head.addEventListener("mousedown", (e) => {
-      if (e.target.tagName === "BUTTON") return;
-      dragging = true;
-      const r = box.getBoundingClientRect();
-      ox = e.clientX - r.left; oy = e.clientY - r.top;
-      e.preventDefault();
-    });
-    document.addEventListener("mousemove", (e) => {
-      if (!dragging) return;
-      box.style.left = Math.max(0, e.clientX - ox) + "px";
-      box.style.top  = Math.max(0, e.clientY - oy) + "px";
-      box.style.right = "auto";
-    });
-    document.addEventListener("mouseup", () => { dragging = false; });
-
-    log("GUI sẵn sàng. Bấm ▶ Start.");
+    running = false;
+    setStatus("Đã dừng");
+    log("=== STOP ===");
   }
 
   function start() {
-    if (state.running) { log("Đang chạy rồi."); return; }
-    if (!qRoot()) log("⚠ Chưa thấy container câu hỏi — chờ trang render.");
-    state.running = true;
-    state.lastSig = "";
-    state.sameCount = 0;
-    state.answered = 0;
-    state.lastBeat = Date.now();
-    setStatus("Đang chạy...");
-    log("Model chain: " + modelChain().join(" → "));
-    log("Vision chain: " + VISION_MODELS.join(" → ") + " (bật: " + getVisionEnabled() + ")");
+    if (running) { log("Đang chạy rồi."); return; }
     loop();
   }
-
   function stop() {
-    if (!state.running) { log("Chưa chạy."); return; }
-    state.running = false;
-    state.gen++;
+    if (!running) { setStatus("Đã dừng"); return; }
+    running = false;
+    genToken++;
     setStatus("Đã dừng");
-    log("■ Đã dừng theo yêu cầu.");
   }
 
-  /* ================= BOOT ================= */
+  /* ============================ TEST / DEBUG ============================ */
+  function dumpHTML() {
+    log("=== DUMP HTML ===");
+    const root = qRoot();
+    if (!root) { log("Không thấy #test-step-question"); return; }
+    let html = root.outerHTML || "";
+    html = html.replace(/src="data:image\/[^"]{60,}"/g, 'src="data:image/…(base64 bỏ)"');
+    log(html.slice(0, 3000));
+    log("=== HẾT DUMP (" + html.length + " ký tự) ===");
+    try { console.log("[AI-SOLVER] DUMP:\n" + html); } catch (e) {}
+  }
+
+  function checkPage() {
+    log("=== CHECK PAGE ===");
+    log("URL: " + location.href);
+    log("qRoot: " + (qRoot() ? "có container" : "KHÔNG thấy"));
+    log("Tiêu đề câu: " + (currentQuestionTitle() || "(trống)"));
+    logSubmitBar();
+
+    const opts = getOptions();
+    log("Options: " + opts.list.length + (opts.type ? " (type=" + opts.type + ")" : ""));
+    opts.list.forEach((el, i) => {
+      log("  " + optionLabel(el, i) + ". " + (optionText(el) || "(trống)").slice(0, 70) + (optionImageUrl(el) ? " [ẢNH]" : ""));
+    });
+
+    const fills = getFillInputs();
+    log("Fill inputs: " + fills.length);
+    fills.forEach((el, i) => log("  #" + (i + 1) + " id=" + (el.id || "?") + " type=" + (el.type || "?")));
+
+    const essay = getEssayInput();
+    log("Essay textarea: " + (essay ? "có (id=" + (essay.id || "?") + ")" : "không"));
+    log("Vision bật: " + (getVisionEnabled() ? "có" : "không") + " · ảnh đề: " + stemImages().length);
+    log("Blank numbered: " + (getTargetBlankNumber() || "không"));
+
+    const sheet = qsa(".answer-sheet .option");
+    if (sheet.length) {
+      const done = sheet.filter((o) => o.classList.contains("done")).length;
+      const act = sheet.findIndex((o) => o.classList.contains("active"));
+      log("Answer-sheet: " + sheet.length + " (done: " + done + ", active: #" + (act >= 0 ? act + 1 : "?") + ")");
+    }
+    log("=== HẾT CHECK ===");
+  }
+
+  async function testAI() {
+    log("=== TEST AI ===");
+    log("Model chọn: " + getModel());
+    log("Model đang dùng: " + (getWorkingModel() || "(chưa)"));
+    log("Bị đánh dấu trả phí: " + (Array.from(getPaidSet()).join(", ") || "(không)"));
+
+    const msgs = [{ role: "user", content: 'Trả lời DUY NHẤT bằng JSON: {"answer":"B","reason":"test"}' }];
+    const chain = buildChain(false);
+    log("Chuỗi thử: " + chain.join(" → "));
+
+    for (const m of chain) {
+      log("… " + m);
+      const r = await callModel(m, msgs, 25000);
+      if (r.ok) log("✅ " + m + " OK → " + r.text.slice(0, 100));
+      else if (r.paid) { markPaid(m); log("💳 " + m + " CẦN TRẢ PHÍ → đã đánh dấu bỏ qua."); }
+      else log("✗ " + m + " → " + String(r.err || ("status " + r.status)).slice(0, 120));
+    }
+
+    log("=== TEST VISION ===");
+    const tiny = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+    const vmsgs = [{
+      role: "user",
+      content: [
+        { type: "text", text: 'Ảnh này là gì? Trả lời JSON: {"answer":"A","reason":"..."}' },
+        { type: "image_url", image_url: { url: tiny } }
+      ]
+    }];
+    for (const m of chain) {
+      if (!isVisionModel(m)) continue;
+      log("… [vision] " + m);
+      const r = await callModel(m, vmsgs, 30000);
+      if (r.ok) log("✅ vision " + m + " OK → " + r.text.slice(0, 100));
+      else if (r.paid) { markPaid(m); log("💳 vision " + m + " CẦN TRẢ PHÍ."); }
+      else log("✗ vision " + m + " → " + String(r.err || ("status " + r.status)).slice(0, 120));
+    }
+    log("=== HẾT TEST ===");
+  }
+
+  /* ============================ GUI ============================ */
+  function buildGui() {
+    if (document.getElementById(GUI_ID)) return;
+
+    const wrap = document.createElement("div");
+    wrap.id = GUI_ID;
+    wrap.style.cssText = [
+      "position:fixed", "top:10px", "right:10px", "width:338px", "max-width:95vw",
+      "z-index:2147483647", "background:#0f1216", "color:#e8eaed",
+      "font:12px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif",
+      "border:1px solid #263238", "border-radius:10px",
+      "box-shadow:0 10px 30px rgba(0,0,0,.6)", "overflow:hidden"
+    ].join(";");
+
+    wrap.innerHTML =
+      '<div id="ais-head" style="display:flex;align-items:center;gap:8px;padding:8px 10px;background:linear-gradient(90deg,#134e2a,#1b7a3e);font-weight:700;cursor:move;user-select:none;">' +
+        '<span>⚡ ai slover v39.9</span><span style="flex:1"></span>' +
+        '<button id="ais-collapse" style="background:#0b2b17;color:#cfe8d5;border:1px solid #2e7d32;border-radius:5px;padding:0 7px;cursor:pointer;">–</button>' +
+      '</div>' +
+      '<div id="ais-body" style="padding:8px 10px 10px;">' +
+
+        '<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">' +
+          '<span style="width:78px;color:#9fb3c8;">Model</span>' +
+          '<select id="ais-model" style="flex:1;background:#151b22;color:#e8eaed;border:1px solid #2b3a47;border-radius:5px;padding:3px;"></select>' +
+        '</div>' +
+
+        '<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">' +
+          '<span style="width:78px;color:#9fb3c8;">Model khác</span>' +
+          '<input id="ais-custom" placeholder="vd: openai-fast" style="flex:1;background:#151b22;color:#e8eaed;border:1px solid #2b3a47;border-radius:5px;padding:3px 5px;">' +
+        '</div>' +
+
+        '<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">' +
+          '<span style="width:78px;color:#9fb3c8;">Chu kỳ ms</span>' +
+          '<input id="ais-interval" type="number" min="300" max="10000" step="100" style="width:80px;background:#151b22;color:#e8eaed;border:1px solid #2b3a47;border-radius:5px;padding:3px 5px;">' +
+          '<span style="color:#9fb3c8;">Kiểm tra</span>' +
+          '<input id="ais-verify" type="number" min="0" max="3" style="width:52px;background:#151b22;color:#e8eaed;border:1px solid #2b3a47;border-radius:5px;padding:3px 5px;">' +
+        '</div>' +
+
+        '<label style="display:flex;gap:6px;align-items:center;margin-bottom:4px;cursor:pointer;"><input id="ais-vision" type="checkbox"> 📷 Dùng AI đọc hình (vision)</label>' +
+        '<label style="display:flex;gap:6px;align-items:center;margin-bottom:4px;cursor:pointer;"><input id="ais-redo" type="checkbox"> Làm lại câu đã đúng</label>' +
+        '<label style="display:flex;gap:6px;align-items:center;margin-bottom:8px;cursor:pointer;"><input id="ais-autosubmit" type="checkbox"> Tự nộp bài khi hết câu (nguy hiểm)</label>' +
+
+        '<div style="display:flex;gap:6px;margin-bottom:6px;">' +
+          '<button id="ais-start" style="flex:1;background:#1b7a3e;color:#fff;border:0;border-radius:6px;padding:7px;font-weight:700;cursor:pointer;">▶ Start</button>' +
+          '<button id="ais-stop" style="flex:1;background:#7a1b1b;color:#fff;border:0;border-radius:6px;padding:7px;font-weight:700;cursor:pointer;">■ Stop</button>' +
+        '</div>' +
+
+        '<div style="display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap;">' +
+          '<button id="ais-check" style="flex:1;background:#1b4d7a;color:#fff;border:0;border-radius:6px;padding:5px;cursor:pointer;">🔍 Check page</button>' +
+          '<button id="ais-test" style="flex:1;background:#5a1b7a;color:#fff;border:0;border-radius:6px;padding:5px;cursor:pointer;">🧪 Test AI</button>' +
+        '</div>' +
+        '<div style="display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap;">' +
+          '<button id="ais-models" style="flex:1;background:#0d6b6b;color:#fff;border:0;border-radius:6px;padding:5px;cursor:pointer;">🌐 Model free</button>' +
+          '<button id="ais-dump" style="flex:1;background:#444;color:#fff;border:0;border-radius:6px;padding:5px;cursor:pointer;">🔬 Dump HTML</button>' +
+        '</div>' +
+        '<div style="display:flex;gap:6px;margin-bottom:6px;">' +
+          '<button id="ais-clearpaid" style="flex:1;background:#3a3a3a;color:#ddd;border:0;border-radius:6px;padding:4px;cursor:pointer;">♻ Xoá danh sách trả phí</button>' +
+        '</div>' +
+
+        '<div id="ais-status" style="color:#9fb3c8;margin-bottom:4px;">Sẵn sàng</div>' +
+        '<div id="ais-answer" style="background:#0b2b17;border:1px solid #2e7d32;border-radius:6px;padding:5px 7px;color:#8bf0a8;font-weight:700;margin-bottom:6px;min-height:16px;"></div>' +
+        '<div id="ais-log" style="height:172px;overflow:auto;background:#080b0e;border:1px solid #1e2a33;border-radius:6px;padding:5px;font:11px/1.35 ui-monospace,Consolas,monospace;color:#b8c7d1;"></div>' +
+        '<div style="margin-top:6px;color:#5f7284;font-size:10.5px;">v39.9 · model FREE (gemini) · vision · blank-numbered · chống treo 60s</div>' +
+      '</div>';
+
+    document.body.appendChild(wrap);
+
+    // flush buffered logs
+    const logEl = document.getElementById("ais-log");
+    for (const line of logBuf.slice(-200)) {
+      const d = document.createElement("div");
+      d.textContent = line;
+      logEl.appendChild(d);
+    }
+    logEl.scrollTop = logEl.scrollHeight;
+
+    // ---- fill values ----
+    const sel = document.getElementById("ais-model");
+    const cur = getModel();
+    const choices = MODEL_CHOICES.slice();
+    if (choices.indexOf(cur) < 0) choices.unshift(cur);
+    sel.innerHTML = choices.map((m) => '<option value="' + m + '">' + m + "</option>").join("");
+    sel.value = cur;
+
+    document.getElementById("ais-custom").value = lsGet(MODEL_CUSTOM_KEY, "") || "";
+    document.getElementById("ais-interval").value = getInterval();
+    document.getElementById("ais-verify").value = getVerifyTimes();
+    document.getElementById("ais-vision").checked = getVisionEnabled();
+    document.getElementById("ais-redo").checked = getRedo();
+    document.getElementById("ais-autosubmit").checked = getAutoSubmit();
+
+    // ---- events ----
+    sel.addEventListener("change", () => {
+      lsSet(MODEL_KEY, sel.value);
+      lsSet(MODEL_CUSTOM_KEY, "");
+      document.getElementById("ais-custom").value = "";
+      log("Đổi model → " + sel.value);
+    });
+
+    document.getElementById("ais-custom").addEventListener("change", (e) => {
+      const v = (e.target.value || "").trim();
+      lsSet(MODEL_CUSTOM_KEY, v);
+      log(v ? "Model khác → " + v : "Bỏ model khác.");
+    });
+
+    document.getElementById("ais-interval").addEventListener("change", (e) => {
+      const n = parseInt(e.target.value, 10);
+      lsSet(INTERVAL_KEY, isNaN(n) ? 900 : Math.max(300, Math.min(10000, n)));
+    });
+
+    document.getElementById("ais-verify").addEventListener("change", (e) => {
+      const n = parseInt(e.target.value, 10);
+      lsSet(VERIFY_KEY, isNaN(n) ? 1 : Math.max(0, Math.min(3, n)));
+    });
+
+    document.getElementById("ais-vision").addEventListener("change", (e) => lsSet(VISION_KEY, e.target.checked ? "1" : "0"));
+    document.getElementById("ais-redo").addEventListener("change", (e) => lsSet(REDO_KEY, e.target.checked ? "1" : "0"));
+    document.getElementById("ais-autosubmit").addEventListener("change", (e) => lsSet(AUTOSUBMIT_KEY, e.target.checked ? "1" : "0"));
+
+    document.getElementById("ais-start").addEventListener("click", start);
+    document.getElementById("ais-stop").addEventListener("click", stop);
+    document.getElementById("ais-check").addEventListener("click", checkPage);
+    document.getElementById("ais-test").addEventListener("click", testAI);
+    document.getElementById("ais-models").addEventListener("click", refreshModelList);
+    document.getElementById("ais-dump").addEventListener("click", dumpHTML);
+    document.getElementById("ais-clearpaid").addEventListener("click", () => {
+      clearPaid();
+      log("♻ Đã xoá danh sách model trả phí.");
+    });
+
+    // ---- collapse ----
+    document.getElementById("ais-collapse").addEventListener("click", () => {
+      const body = document.getElementById("ais-body");
+      const hidden = body.style.display === "none";
+      body.style.display = hidden ? "" : "none";
+      document.getElementById("ais-collapse").textContent = hidden ? "–" : "+";
+    });
+
+    // ---- drag ----
+    const head = document.getElementById("ais-head");
+    let drag = false, dx = 0, dy = 0;
+    head.addEventListener("pointerdown", (e) => {
+      if (e.target && e.target.id === "ais-collapse") return;
+      drag = true;
+      const r = wrap.getBoundingClientRect();
+      dx = e.clientX - r.left;
+      dy = e.clientY - r.top;
+      wrap.style.right = "auto";
+      wrap.style.left = r.left + "px";
+      wrap.style.top = r.top + "px";
+      try { head.setPointerCapture(e.pointerId); } catch (err) {}
+    });
+    head.addEventListener("pointermove", (e) => {
+      if (!drag) return;
+      const w = wrap.offsetWidth;
+      const x = Math.max(0, Math.min(window.innerWidth - w - 4, e.clientX - dx));
+      const y = Math.max(0, Math.min(window.innerHeight - 40, e.clientY - dy));
+      wrap.style.left = x + "px";
+      wrap.style.top = y + "px";
+    });
+    head.addEventListener("pointerup", () => { drag = false; });
+    head.addEventListener("pointercancel", () => { drag = false; });
+  }
+
+  /* ============================ BOOT ============================ */
   function boot() {
     buildGui();
     log("VERSION " + VERSION_STR + " booted at " + new Date().toISOString());
     log("URL: " + location.href);
-    log("qRoot: " + (qRoot() ? "có container" : "chưa thấy"));
+    log("qRoot: " + (qRoot() ? "có container" : "chưa thấy (trang đang tải)"));
+    log("Model mặc định: " + DEFAULT_MODEL + " · đang chọn: " + getModel());
+    if (getPaidSet().size) log("⚠ Model bị đánh dấu trả phí: " + Array.from(getPaidSet()).join(", ") + " (bấm ♻ để xoá)");
   }
 
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", () => setTimeout(boot, 800));
+    document.addEventListener("DOMContentLoaded", boot, { once: true });
   } else {
-    setTimeout(boot, 800);
+    boot();
   }
+
+  // expose for debugging
+  window.__AI_SOLVER__ = {
+    start: start,
+    stop: stop,
+    check: checkPage,
+    test: testAI,
+    models: refreshModelList,
+    paid: () => Array.from(getPaidSet()),
+    clearPaid: clearPaid
+  };
 })();
