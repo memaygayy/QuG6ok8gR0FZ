@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         AI Solver v40.1
+// @name         AI Solver v40.2
 // @namespace    https://github.com/memaygayy/QuG6ok8gR0FZ
-// @version      40.1.0
-// @description  Tự động giải trắc nghiệm / điền từ / tự luận / blank-numbered / đáp án hình / đúng-sai trên onluyen.vn
+// @version      40.2.0
+// @description  Tự động giải trắc nghiệm / điền từ / tự luận / blank-numbered / đáp án hình / đúng-sai có đồ thị trên onluyen.vn
 // @author       memaygayy
 // @match        https://*.onluyen.vn/*
 // @match        https://onluyen.vn/*
@@ -19,11 +19,11 @@
 
 (function () {
   "use strict";
-  if (window.__AI_SOLVER_40_1__) return;
-  window.__AI_SOLVER_40_1__ = true;
+  if (window.__AI_SOLVER_40_2__) return;
+  window.__AI_SOLVER_40_2__ = true;
 
   /* ============================ CONFIG ============================ */
-  const VERSION_STR = "40.1.0";
+  const VERSION_STR = "40.2.0";
   const GUI_ID = "ai-solver-v38";
 
   const ENDPOINTS = [
@@ -42,37 +42,42 @@
   const MODEL_WORKING = "HW_SOLVER_MODEL_WORKING_V3";
   const COMBO_KEY = "HW_SOLVER_WORKING_COMBO";
   const PAID_KEY = "HW_SOLVER_PAID_MODELS";
+  const NOVISION_KEY = "HW_SOLVER_NOVISION_MODELS";
   const INTERVAL_KEY = "HW_SOLVER_INTERVAL";
-  const VERIFY_KEY = "HW_SOLVER_VERIFY";
+  const SAMPLES_KEY = "HW_SOLVER_SAMPLES_V2";
   const AUTOSUBMIT_KEY = "HW_SOLVER_AUTO_SUBMIT";
   const REDO_KEY = "HW_SOLVER_REDO_DONE";
   const VISION_KEY = "HW_SOLVER_VISION";
   const APIKEY_KEY = "HW_SOLVER_API_KEY";
   const USEKEY_KEY = "HW_SOLVER_USE_KEY";
 
+  // openai-fast = free + ĐỌC ĐƯỢC ẢNH. openai = free nhưng KHÔNG nhận ảnh.
   const DEFAULT_MODEL = "openai-fast";
-  const FALLBACK_MODELS = ["openai", "mistral", "qwen-coder", "nova-fast", "gemini", "llama", "deepseek"];
+  const FALLBACK_MODELS = ["openai-fast", "openai", "mistral", "nova-fast", "gemini", "qwen-coder", "openai-large", "llama", "deepseek"];
   const MODEL_CHOICES = [
-    "openai-fast", "openai", "mistral", "qwen-coder", "nova-fast",
-    "gemini", "llama", "deepseek", "openai-large", "claude",
-    "deepseek/deepseek-v4-flash"
+    "openai-fast", "openai", "openai-large", "nova-fast", "mistral",
+    "gemini", "qwen-coder", "llama", "deepseek", "claude"
   ];
-  const VISION_MODELS = ["gemini", "openai", "openai-large", "openai-fast", "mistral", "claude"];
+  // model THẬT SỰ nhận ảnh (đã kiểm chứng qua test vision)
+  const VISION_MODELS = ["openai-fast", "openai-large", "gemini", "claude", "mistral"];
 
   const MAX_OPTIONS = 12;
   const API_TIMEOUT = 30000;
   const VISION_TIMEOUT = 40000;
-  const ASK_BUDGET_MS = 85000;
-  const VISION_BUDGET_MS = 85000;
-  const WATCHDOG_MS = 150000;
+  const ASK_BUDGET_MS = 45000;
+  const VISION_BUDGET_MS = 45000;
+  const WATCHDOG_MS = 300000;
   const MAX_VISION_BYTES = 4000000;
 
   const BAD_BTN_RE = /(bỏ qua|skip|nộp bài|nộp|xác nhận nộp|hủy|huỷ|cancel|thoát|đóng|close|báo lỗi)/i;
   const NEXT_RE = /(câu tiếp|câu sau|tiếp theo|câu kế|kế tiếp|next)/i;
   const ANSWER_BTN_RE = /(trả lời|làm bài|kiểm tra|xác nhận|gửi|lưu|answer)/i;
 
-  const ERR_TEXT_RE = /(not enough credits|enough credits|needs paid pollen|paid pollen|top[ -]?up|insufficient (credit|balance|pollen|quota)|payment required|too many requests|rate[ -]?limit|invalid api key|api key (is )?(invalid|missing|required|not)|model not found|no such model|unauthorized|quota exceeded|account .*suspended|please (log ?in|sign ?in))/i;
+  const ERR_TEXT_RE = /(not enough credits|enough credits|needs paid pollen|paid pollen|top[ -]?up|insufficient (credit|balance|pollen|quota)|payment required|too many requests|rate[ -]?limit|invalid api key|api key (is )?(invalid|missing|required|not)|model not found|no such model|unauthorized|quota exceeded|a valid api key is required)/i;
   const PAID_TEXT_RE = /(credit|pollen|top[ -]?up|payment|balance|quota|insufficient|paid)/i;
+
+  // model "mù" ảnh trả về những câu này
+  const NOIMAGE_RE = /(không (?:thấy|nhận|được|thể thấy) (?:ảnh|hình)|chưa (?:thấy|nhận được|được cung cấp) (?:ảnh|hình|nội dung)|không có (?:ảnh|hình)|don'?t see (?:any )?(?:image|picture|photo|content)|no image (?:was |is )?(?:provided|attached|included|given)|image (?:is )?(?:not |missing|absent|unavailable)|can'?t (?:see|view) (?:the )?image|unable to (?:see|view|process) (?:the )?image)/i;
 
   /* ============================ STATE ============================ */
   let running = false;
@@ -130,6 +135,11 @@
     const el = document.getElementById("ais-status");
     if (el) el.textContent = t;
   }
+  function refreshStatus() {
+    const w = getWorkingModel();
+    const m = getModel();
+    setStatus((running ? "Đang chạy" : "Sẵn sàng") + " · " + (w && w !== m ? m + " → " + w : m));
+  }
   function showAnswer(t) {
     const el = document.getElementById("ais-answer");
     if (el) el.textContent = t || "";
@@ -152,9 +162,9 @@
     const n = parseInt(lsGet(INTERVAL_KEY, "900"), 10);
     return isNaN(n) ? 900 : Math.max(300, Math.min(10000, n));
   }
-  function getVerifyTimes() {
-    const n = parseInt(lsGet(VERIFY_KEY, "1"), 10);
-    return isNaN(n) ? 1 : Math.max(0, Math.min(3, n));
+  function getSamples() {
+    const n = parseInt(lsGet(SAMPLES_KEY, "3"), 10);
+    return isNaN(n) ? 3 : Math.max(1, Math.min(5, n));
   }
   function getVisionEnabled() { return lsBool(VISION_KEY, true); }
   function getRedo() { return lsBool(REDO_KEY, true); }
@@ -173,7 +183,7 @@
     return m || DEFAULT_MODEL;
   }
   function getWorkingModel() { return (lsGet(MODEL_WORKING, "") || "").trim(); }
-  function setWorkingModel(m) { if (m) lsSet(MODEL_WORKING, m); }
+  function setWorkingModel(m) { if (m) { lsSet(MODEL_WORKING, m); refreshStatus(); } }
 
   function getWorkingCombo() {
     const raw = lsGet(COMBO_KEY, "");
@@ -187,20 +197,44 @@
     lsSet(COMBO_KEY, c.model + "|" + c.ep + "|" + (c.useKey ? "k" : "a"));
   }
 
-  function getPaidSet() {
+  function getSet(key) {
     try {
-      const arr = JSON.parse(lsGet(PAID_KEY, "[]"));
+      const arr = JSON.parse(lsGet(key, "[]"));
       return new Set(Array.isArray(arr) ? arr : []);
     } catch (e) { return new Set(); }
   }
+  function addToSet(key, v) {
+    if (!v) return;
+    const s = getSet(key);
+    s.add(String(v));
+    lsSet(key, JSON.stringify(Array.from(s)));
+  }
+
+  function getPaidSet() { return getSet(PAID_KEY); }
+  function isPaid(m) { return getPaidSet().has(String(m)); }
   function markPaid(model) {
     if (!model) return;
-    const s = getPaidSet();
-    s.add(String(model));
-    lsSet(PAID_KEY, JSON.stringify(Array.from(s)));
+    addToSet(PAID_KEY, model);
+    // nếu model đang chọn bị đánh dấu trả phí → tự đổi sang mặc định
+    if (getModel() === model) {
+      lsSet(MODEL_KEY, DEFAULT_MODEL);
+      if ((lsGet(MODEL_CUSTOM_KEY, "") || "") === model) lsSet(MODEL_CUSTOM_KEY, "");
+      log("⚠ Model \"" + model + "\" cần trả phí → tự chuyển sang " + DEFAULT_MODEL);
+      refreshStatus();
+    }
   }
-  function isPaid(model) { return getPaidSet().has(String(model)); }
-  function clearPaid() { lsSet(PAID_KEY, "[]"); }
+
+  function getNoVisionSet() { return getSet(NOVISION_KEY); }
+  function isNoVision(m) { return getNoVisionSet().has(String(m)); }
+  function markNoVision(model) {
+    if (!model) return;
+    addToSet(NOVISION_KEY, model);
+  }
+  function clearAllMarks() {
+    lsSet(PAID_KEY, "[]");
+    lsSet(NOVISION_KEY, "[]");
+    lsSet(COMBO_KEY, "");
+  }
 
   /* ============================ NETWORK ============================ */
   function gmRequest(opts) {
@@ -271,7 +305,7 @@
     const body = {
       model: model,
       messages: messages,
-      temperature: 0.2,
+      temperature: 0,
       private: true,
       referrer: "onluyen-solver"
     };
@@ -306,6 +340,11 @@
       return { ok: false, paid: PAID_TEXT_RE.test(apiErr), status: r.status, err: apiErr };
     }
 
+    // phát hiện model không nhận được ảnh
+    if (opts.vision && NOIMAGE_RE.test(content)) {
+      return { ok: false, paid: false, status: r.status, err: "model không nhận được ảnh", noVision: true };
+    }
+
     return { ok: true, text: content };
   }
 
@@ -327,17 +366,19 @@
     FALLBACK_MODELS.forEach(push);
 
     if (needVision) {
-      out = out.filter((m) => isVisionModel(m)).concat(out.filter((m) => !isVisionModel(m)));
+      out = out.filter((m) => isVisionModel(m) && !isNoVision(m))
+        .concat(out.filter((m) => !isVisionModel(m) || isNoVision(m)));
     }
-    return out.slice(0, 6);
+    return out.slice(0, 7);
   }
 
-  function buildAttempts(models) {
+  function buildAttempts(models, visionOnly) {
     const out = [];
     const seen = new Set();
     const add = (m, ep, useKey) => {
       if (!m) return;
-      if (useKey && isPaid(m)) return;
+      if (isPaid(m)) return;
+      if (visionOnly && isNoVision(m)) return;
       const k = m + "|" + ep + "|" + (useKey ? "k" : "a");
       if (seen.has(k)) return;
       seen.add(k);
@@ -352,7 +393,6 @@
       for (const m of models) add(m, 0, true);
       for (const m of models) add(m, 0, false);
       for (const m of models) add(m, 1, false);
-      for (const m of models) add(m, 1, true);
     } else {
       for (const m of models) add(m, 0, false);
       for (const m of models) add(m, 0, true);
@@ -366,7 +406,7 @@
   }
 
   async function runChain(models, messages, budget, perTimeout, visionOnly) {
-    const attempts = buildAttempts(models);
+    const attempts = buildAttempts(models, visionOnly);
     if (!attempts.length) return { ok: false, reason: "no-attempts" };
     const start = Date.now();
     let lastErr = "";
@@ -379,7 +419,7 @@
 
       const to = Math.min(perTimeout, left);
       log("… " + a.model + " (" + tagOf(a) + ")");
-      const r = await callModel(a.model, messages, to, a);
+      const r = await callModel(a.model, messages, to, { ep: a.ep, useKey: a.useKey, vision: visionOnly });
 
       if (r.ok) {
         setWorkingModel(a.model);
@@ -388,10 +428,16 @@
         return { ok: true, text: r.text, model: a.model, attempt: a };
       }
 
+      if (r.noVision) {
+        markNoVision(a.model);
+        log("🖼 " + a.model + " không nhận được ảnh → đánh dấu, thử model khác.");
+        continue;
+      }
+
       if (r.paid) {
         sawPaid = true;
-        if (a.useKey) { markPaid(a.model); log("💳 " + a.model + " cần trả phí (key) → bỏ model này."); }
-        else log("💳 " + a.model + " cần trả phí (anon).");
+        markPaid(a.model);
+        log("💳 " + a.model + " cần trả phí → bỏ.");
         lastErr = r.err || "";
         continue;
       }
@@ -430,25 +476,17 @@
         const arr = JSON.parse(r.text);
         if (!Array.isArray(arr)) { log("✗ " + url + " không phải mảng"); continue; }
         const names = arr.map((m) => (typeof m === "string" ? m : m.name || m.id || "")).filter(Boolean);
-        const freeNames = arr
-          .filter((m) => typeof m !== "object" || (!m.paid_only && !m.paidOnly && m.tier !== "paid" && !/paid/i.test(String(m.tier || ""))))
-          .map((m) => (typeof m === "string" ? m : m.name || m.id || ""))
-          .filter(Boolean);
-        log("📋 " + url + " → " + names.length + " model");
-        log("FREE (" + freeNames.length + "): " + freeNames.slice(0, 60).join(", "));
-        const paidNames = names.filter((n) => freeNames.indexOf(n) < 0);
-        if (paidNames.length) log("PAID (" + paidNames.length + "): " + paidNames.slice(0, 40).join(", "));
+        log("📋 " + names.length + " model: " + names.slice(0, 60).join(", "));
         const vm = arr
           .filter((m) => typeof m === "object" && (m.vision === true || m.supports_vision === true))
           .map((m) => m.name || m.id);
         if (vm.length) log("👁 Vision: " + vm.join(", "));
         log("=== HẾT DANH SÁCH ===");
-        return freeNames;
+        return names;
       } catch (e) {
         log("✗ parse " + url + " lỗi");
       }
     }
-    log("=== KHÔNG LẤY ĐƯỢC DANH SÁCH ===");
     return [];
   }
 
@@ -547,7 +585,6 @@
     return parts.slice(0, n);
   }
 
-  /* --------- ĐÚNG/SAI PARSER --------- */
   function tfNorm(v) {
     const s = String(v == null ? "" : v).trim().toLowerCase();
     if (!s) return "";
@@ -727,11 +764,11 @@
   function stemImages() {
     const root = qRoot();
     if (!root) return [];
-    const imgs = qsa(".question-name img, .question-text img, .fadein img", root);
+    const imgs = qsa(".question-name img, .question-text img, .fadein img, .content img", root);
     const out = [];
     for (const img of imgs) {
       const src = img.getAttribute("src") || img.currentSrc || "";
-      if (isImageSrc(src)) out.push(src);
+      if (isImageSrc(src) && out.indexOf(src) < 0) out.push(src);
     }
     return out.slice(0, 4);
   }
@@ -749,7 +786,7 @@
     let text = "";
     try {
       const clone = holder.cloneNode(true);
-      clone.querySelectorAll(".list-selection, .options, .question-option, .select-item, .row.text-left.options")
+      clone.querySelectorAll(".list-selection, .options, .question-option, .select-item, .row.text-left.options, .true-false, .child-content")
         .forEach((e) => e.remove());
       let n = 0;
       clone.querySelectorAll("input, textarea, [contenteditable]").forEach((el) => {
@@ -768,6 +805,11 @@
     if (extra) {
       const t2 = (extra.textContent || "").replace(/\s+/g, " ").trim();
       if (t2) text += "\n\n" + t2;
+    }
+    const ts = qs(".title-static", root);
+    if (ts) {
+      const t3 = (ts.textContent || "").replace(/\s+/g, " ").trim();
+      if (t3 && text.indexOf(t3) < 0) text = t3 + "\n\n" + text;
     }
     return text.slice(0, 4500);
   }
@@ -837,7 +879,7 @@
     return false;
   }
 
-  /* ============================ ĐÚNG/SAI DETECT ============================ */
+  /* ============================ ĐÚNG/SAI ============================ */
   function labelTextFor(inp) {
     if (!inp) return "";
     if (inp.id) {
@@ -898,7 +940,6 @@
     }
 
     if (!label) {
-      // thử tìm trong khối block
       const oc = qs(".option-char", block);
       if (oc) {
         const m = (oc.textContent || "").match(/([A-Za-zĐđ])/);
@@ -923,7 +964,6 @@
       if (g) out.push(g);
     };
 
-    // 1) khối .true-false
     const blocks = qsa('.true-false, [class*="true-false"], [class*="truefalse"], [class*="true_false"]', root);
     for (const b of blocks) {
       if (insideGui(b)) continue;
@@ -939,7 +979,6 @@
     }
     if (out.length) return out;
 
-    // 2) fallback: nhóm radio theo holder
     const radios = qsa('input[type="radio"]', root).filter((r) => !r.disabled && !insideGui(r));
     const map = new Map();
     for (const r of radios) {
@@ -1212,13 +1251,12 @@
   }
 
   /* ============================ PROMPTS ============================ */
-  function buildMcqMessages(stem, items, blankN, prevLetter) {
+  function buildMcqMessages(stem, items, blankN) {
     const opts = items.map((o) => o.label + ". " + (o.text || "(nội dung là hình ảnh, không đọc được bằng text)")).join("\n");
     let user = "";
     if (blankN) user += "Đoạn văn dưới đây có các chỗ trống (1)…(n). Chọn đáp án đúng để điền vào CHỖ TRỐNG SỐ (" + blankN + ").\n\n";
     user += "ĐỀ BÀI:\n" + stem + "\n\nCÁC LỰA CHỌN:\n" + opts + "\n\n";
     user += 'Hãy chọn đúng 1 đáp án. Trả lời DUY NHẤT bằng JSON: {"answer":"<chữ cái>","reason":"<giải thích ngắn bằng tiếng Việt>"}';
-    if (prevLetter) user += '\nLần trước bạn đã chọn "' + prevLetter + '". Hãy KIỂM TRA LẠI THẬT KỸ. Nếu vẫn đúng thì giữ nguyên, nếu sai thì đổi.';
 
     return [
       { role: "system", content: "Bạn là giáo viên giỏi, giải đề chính xác, chỉ trả về JSON." },
@@ -1226,16 +1264,12 @@
     ];
   }
 
-  function buildTrueFalseMessages(stem, items, prev) {
+  function buildTrueFalseMessages(stem, items) {
     const lines = items.map((it) => "(" + it.key + ") " + (it.text || "(trống)")).join("\n");
     const example = items.map((it) => '"' + it.key + '":"Đúng"').join(",");
     let user = "ĐỀ BÀI:\n" + stem + "\n\nCÁC Ý CẦN ĐÁNH GIÁ ĐÚNG/SAI:\n" + lines + "\n\n";
     user += "Với MỖI ý ở trên, hãy đánh giá là ĐÚNG hay SAI.\n";
     user += "Trả lời DUY NHẤT bằng JSON (đủ " + items.length + " khóa): {" + example + "}";
-    if (prev) {
-      const prevStr = items.map((it) => it.key + "=" + (prev[it.key] === "true" ? "Đúng" : prev[it.key] === "false" ? "Sai" : "?")).join(", ");
-      user += "\nLần trước bạn đã trả lời: " + prevStr + ". Kiểm tra lại thật kỹ từng ý, giữ nguyên nếu đúng, sửa nếu sai.";
-    }
     return [
       { role: "system", content: "Bạn là giáo viên giỏi, đánh giá đúng/sai chính xác, chỉ trả về JSON." },
       { role: "user", content: user }
@@ -1262,13 +1296,13 @@
     ];
   }
 
-  function buildVisionMcqParts(stem, items, blankN, prevLetter) {
+  function buildVisionMcqParts(stem, items, blankN) {
     const content = [];
     let head = "";
     if (blankN) head += "Chọn đáp án đúng để điền vào CHỖ TRỐNG SỐ (" + blankN + ") trong đoạn văn.\n\n";
     head += "ĐỀ BÀI (phần chữ):\n" + (stem || "(không có chữ)") + "\n\n";
     const sImgs = stemImages();
-    if (sImgs.length) head += "(Ảnh của đề bài được đính kèm bên dưới.)\n";
+    if (sImgs.length) head += "(Ảnh/đồ thị của đề bài được đính kèm bên dưới.)\n";
     content.push({ type: "text", text: head });
 
     for (const src of sImgs) content.push({ type: "image_url", image_url: { url: src } });
@@ -1279,12 +1313,33 @@
       else content.push({ type: "text", text: o.text || "(trống)" });
     }
 
-    let tail = '\nHãy quan sát THẬT KỸ các hình ảnh (đồ thị, bảng số liệu, hình vẽ) và chọn đáp án đúng. Trả lời DUY NHẤT bằng JSON: {"answer":"<chữ cái>","reason":"<giải thích ngắn>"}';
-    if (prevLetter) tail += '\nLần trước bạn đã chọn "' + prevLetter + '". Kiểm tra lại thật kỹ, giữ nguyên nếu đúng, đổi nếu sai.';
-    content.push({ type: "text", text: tail });
+    content.push({ type: "text", text: '\nHãy quan sát THẬT KỸ các hình ảnh (đồ thị, bảng số liệu, hình vẽ) và chọn đáp án đúng. Trả lời DUY NHẤT bằng JSON: {"answer":"<chữ cái>","reason":"<giải thích ngắn>"}' });
 
     return [
       { role: "system", content: "Bạn là giáo viên giỏi, đọc và phân tích được hình ảnh, chỉ trả về JSON." },
+      { role: "user", content: content }
+    ];
+  }
+
+  function buildVisionTrueFalseParts(stem, items) {
+    const content = [];
+    let head = "ĐỀ BÀI:\n" + (stem || "(không có chữ)") + "\n\n";
+    const sImgs = stemImages();
+    if (sImgs.length) head += "(Ảnh/đồ thị của đề bài được đính kèm bên dưới.)\n";
+    content.push({ type: "text", text: head });
+
+    for (const src of sImgs) content.push({ type: "image_url", image_url: { url: src } });
+
+    const lines = items.map((it) => "(" + it.key + ") " + (it.text || "(trống)")).join("\n");
+    content.push({ type: "text", text: "\nCÁC Ý CẦN ĐÁNH GIÁ ĐÚNG/SAI:\n" + lines + "\n" });
+
+    const example = items.map((it) => '"' + it.key + '":"Đúng"').join(",");
+    let tail = "Dựa vào đồ thị/hình ảnh và đề bài, hãy đánh giá TỪNG ý ở trên là ĐÚNG hay SAI.";
+    tail += " Trả lời DUY NHẤT bằng JSON (đủ " + items.length + " khóa): {" + example + "}";
+    content.push({ type: "text", text: tail });
+
+    return [
+      { role: "system", content: "Bạn là giáo viên giỏi, đọc và phân tích hình ảnh/đồ thị, đánh giá đúng/sai chính xác, chỉ trả về JSON." },
       { role: "user", content: content }
     ];
   }
@@ -1309,38 +1364,39 @@
     return false;
   }
 
-  async function solveMcq(stem, items, blankN, useVision, prevLetter) {
+  async function solveMcqOnce(stem, items, blankN, useVision) {
     if (useVision) {
-      const parts = buildVisionMcqParts(stem, items, blankN, prevLetter);
+      const parts = buildVisionMcqParts(stem, items, blankN);
       const r = await askAIVision(parts, { budget: VISION_BUDGET_MS });
       if (r.ok) {
         const p = parseAnswerObj(r.text, items.map((o) => o.label));
         if (p) return { letter: p.letter, reason: p.reason, model: r.model, via: "vision" };
-        log("⚠ Vision trả lời không đọc được → thử text.");
       }
     }
-    const msgs = buildMcqMessages(stem, items, blankN, prevLetter);
+    const msgs = buildMcqMessages(stem, items, blankN);
     const r2 = await askAI(msgs, { budget: ASK_BUDGET_MS });
     if (r2.ok) {
       const p = parseAnswerObj(r2.text, items.map((o) => o.label));
       if (p) return { letter: p.letter, reason: p.reason, model: r2.model, via: "text" };
-      log("⚠ AI trả lời không đọc được: " + r2.text.slice(0, 160));
     }
     return null;
   }
 
-  async function solveTrueFalse(stem, items, prev) {
-    const msgs = buildTrueFalseMessages(stem, items, prev);
+  async function solveTrueFalseOnce(stem, items, useVision) {
+    const keys = items.map((it) => it.key);
+    if (useVision) {
+      const parts = buildVisionTrueFalseParts(stem, items);
+      const rv = await askAIVision(parts, { budget: VISION_BUDGET_MS });
+      if (rv.ok) {
+        const p = parseTrueFalseAnswers(rv.text, keys);
+        if (Object.keys(p).length) return p;
+      }
+    }
+    const msgs = buildTrueFalseMessages(stem, items);
     const r = await askAI(msgs, { budget: ASK_BUDGET_MS });
     if (!r.ok) return null;
-    const keys = items.map((it) => it.key);
     const p = parseTrueFalseAnswers(r.text, keys);
-    if (Object.keys(p).length) {
-      log("AI đánh giá: " + items.map((it) => it.key + "=" + (p[it.key] === "true" ? "Đ" : p[it.key] === "false" ? "S" : "?")).join(" "));
-      return p;
-    }
-    log("⚠ Không đọc được trả lời đúng/sai: " + r.text.slice(0, 180));
-    return null;
+    return Object.keys(p).length ? p : null;
   }
 
   async function stepMcq(opts, token) {
@@ -1359,44 +1415,53 @@
       img: optionImageUrl(el)
     }));
 
-    log("Đáp án: " + items.map((o) => o.label + (o.img ? "(ảnh)" : "") + ". " + (o.text || "").slice(0, 45)).join(" | "));
-
     const useVision = shouldUseVision(items);
     if (useVision) {
       const nImg = items.filter((o) => o.img).length;
       log("📷 Ảnh: " + nImg + "/" + items.length + " đáp án, " + stemImages().length + " trong đề → dùng vision.");
     }
 
-    const first = await solveMcq(stem, items, blankN, useVision, "");
-    if (token !== genToken) return;
-    if (!first) { log("⚠ Không có đáp án — chuyển câu."); await advance(); return; }
+    const n = getSamples();
+    const votes = {};
+    const samples = [];
+    log("Hỏi " + n + " lần độc lập…");
+    for (let i = 0; i < n; i++) {
+      if (token !== genToken) return;
+      const r = await solveMcqOnce(stem, items, blankN, useVision);
+      if (!r) continue;
+      samples.push(r);
+      votes[r.letter] = (votes[r.letter] || 0) + 1;
+      log("  #" + (i + 1) + ": " + r.letter);
+    }
 
-    let target = items.find((o) => o.label === first.letter);
-    if (!target) { log("⚠ Đáp án AI trả về không khớp lựa chọn (" + first.letter + ") — chuyển câu."); await advance(); return; }
+    if (!samples.length) { log("⚠ Không có đáp án — chuyển câu."); await advance(); return; }
+
+    // bầu chọn đa số
+    const entries = Object.entries(votes).sort((a, b) => b[1] - a[1]);
+    let winLetter = "";
+    if (entries.length === 1) winLetter = entries[0][0];
+    else if (entries[0][1] > entries[1][1]) winLetter = entries[0][0];
+
+    let winner;
+    if (!winLetter) {
+      winner = samples[0];
+      log("… Hòa phiếu (" + entries.map(e => e[0] + "=" + e[1]).join(", ") + ") → giữ đáp án đầu: " + winner.letter);
+    } else {
+      winLetter = entries[0][0];
+      winner = samples.find((s) => s.letter === winLetter) || samples[0];
+      log("🎯 Đồng thuận " + votes[winLetter] + "/" + samples.length + " → " + winLetter);
+    }
+
+    const target = items.find((o) => o.label === winner.letter);
+    if (!target) { log("⚠ Đáp án AI trả không khớp lựa chọn (" + winner.letter + ") — chuyển câu."); await advance(); return; }
 
     log("AI chọn " + target.label + (target.text ? ". " + target.text.slice(0, 70) : ". (hình ảnh)") +
-      (first.reason ? ' · "' + first.reason.slice(0, 110) + '"' : ""));
+      (winner.reason ? ' · "' + winner.reason.slice(0, 110) + '"' : ""));
     showAnswer(target.label + ". " + (target.text || "(hình ảnh)"));
 
-    let ok = await applyAnswer(target.el);
+    const ok = await applyAnswer(target.el);
     if (token !== genToken) return;
     log(ok ? "Đã tick " + target.label + "." : "⚠ Không tick được " + target.label + ".");
-
-    const times = getVerifyTimes();
-    for (let i = 0; i < times; i++) {
-      if (token !== genToken) return;
-      const again = await solveMcq(stem, items, blankN, useVision, target.label);
-      if (!again) { log("… Kiểm tra " + (i + 1) + ": không gọi được AI — bỏ qua."); continue; }
-      if (again.letter === target.label) {
-        log("✓ Kiểm tra " + (i + 1) + " giữ: " + target.label);
-        continue;
-      }
-      const alt = items.find((o) => o.label === again.letter);
-      if (!alt) { log("… Kiểm tra " + (i + 1) + ": AI đổi sang " + again.letter + " nhưng không khớp — bỏ qua."); continue; }
-      log("↻ Kiểm tra " + (i + 1) + " đổi sang " + alt.label + " · " + (again.reason || "").slice(0, 100));
-      const ok2 = await applyAnswer(alt.el);
-      if (ok2) { target = alt; showAnswer(alt.label + ". " + (alt.text || "(hình ảnh)")); }
-    }
 
     await advance();
   }
@@ -1405,62 +1470,62 @@
     const sig = sigNow();
     log("Tìm thấy " + groups.length + " ý Đúng/Sai | " + currentQuestionTitle());
 
-    let stem = getStemText();
-    const root = qRoot();
-    if (root) {
-      const ts = qs(".title-static", root);
-      if (ts) {
-        const t = (ts.textContent || "").replace(/\s+/g, " ").trim();
-        if (t && stem.indexOf(t) < 0) stem = t + "\n\n" + stem;
-      }
-    }
-
+    const stem = getStemText();
     const items = groups.map((g, i) => ({
       key: g.label || String.fromCharCode(65 + i),
       text: g.text || "",
       group: g
     }));
 
-    log("Ý: " + items.map((it) => it.key + "=" + (it.text || "(trống)").slice(0, 40)).join(" | "));
+    log("Ý: " + items.map((it) => it.key + "=" + (it.text || "(trống)").slice(0, 50)).join(" | "));
 
-    const first = await solveTrueFalse(stem, items, null);
-    if (token !== genToken) return;
-    if (!first) { log("⚠ AI không trả lời được — chuyển câu."); await advance(); return; }
+    const sImgs = stemImages();
+    let totalBytes = 0;
+    for (const s of sImgs) totalBytes += imgBytes(s);
+    const useVision = getVisionEnabled() && sImgs.length > 0 && totalBytes <= MAX_VISION_BYTES;
+    if (useVision) log("📷 " + sImgs.length + " ảnh trong đề (" + Math.round(totalBytes / 1024) + "KB) → dùng vision.");
+    else if (sImgs.length === 0) log("📷 Không có ảnh trong đề → dùng text.");
+
+    const n = getSamples();
+    const samples = [];
+    log("Hỏi " + n + " lần độc lập…");
+    for (let i = 0; i < n; i++) {
+      if (token !== genToken) return;
+      const r = await solveTrueFalseOnce(stem, items, useVision);
+      if (!r) continue;
+      samples.push(r);
+      log("  #" + (i + 1) + ": " + items.map((it) => it.key + "=" + (r[it.key] === "true" ? "Đ" : r[it.key] === "false" ? "S" : "?")).join(" "));
+    }
+
+    if (!samples.length) { log("⚠ AI không trả lời được — chuyển câu."); await advance(); return; }
+
+    // bầu chọn đa số từng ý
+    const final = {};
+    for (const it of items) {
+      let t = 0, f = 0;
+      for (const s of samples) {
+        if (s[it.key] === "true") t++;
+        else if (s[it.key] === "false") f++;
+      }
+      if (t > f) final[it.key] = "true";
+      else if (f > t) final[it.key] = "false";
+      else final[it.key] = samples[0][it.key] || "";
+    }
+
+    const finalStr = items.map((it) => it.key + ":" + (final[it.key] === "true" ? "Đ" : final[it.key] === "false" ? "S" : "?")).join(" ");
+    log("🎯 Kết quả: " + finalStr);
+    showAnswer(finalStr);
 
     const current = {};
     for (const it of items) {
-      const v = first[it.key];
-      if (!v) { log("⚠ AI thiếu ý " + it.key); continue; }
+      const v = final[it.key];
+      if (!v) { log("⚠ Thiếu ý " + it.key); continue; }
       const ok = await applyTrueFalse(it.group, v);
       log((ok ? "Đã chọn " : "⚠ Không chọn được ") + it.key + " = " + (v === "true" ? "Đúng" : "Sai"));
       if (ok) current[it.key] = v;
     }
 
-    const fmt = (m) => items.map((it) => it.key + ":" + (m[it.key] === "true" ? "Đ" : m[it.key] === "false" ? "S" : "?")).join(" ");
-    showAnswer(fmt(current));
-
     if (Object.keys(current).length === 0) { log("⚠ Không chọn được ý nào — chuyển câu."); await advance(); return; }
-
-    const times = getVerifyTimes();
-    for (let i = 0; i < times; i++) {
-      if (token !== genToken) return;
-      const again = await solveTrueFalse(stem, items, current);
-      if (!again) { log("… Kiểm tra " + (i + 1) + ": AI không trả lời — bỏ qua."); continue; }
-      let changed = 0;
-      for (const it of items) {
-        const v = again[it.key];
-        if (!v) continue;
-        if (current[it.key] === v) continue;
-        const ok = await applyTrueFalse(it.group, v);
-        if (ok) {
-          current[it.key] = v;
-          changed++;
-          log("↻ Sửa " + it.key + " → " + (v === "true" ? "Đúng" : "Sai"));
-        }
-      }
-      log("✓ Kiểm tra " + (i + 1) + (changed ? " (đổi " + changed + " ý)" : " giữ nguyên"));
-      showAnswer(fmt(current));
-    }
 
     await sleep(200);
     await advance();
@@ -1468,8 +1533,7 @@
 
   async function stepFill(inputs, token) {
     const sig = sigNow();
-    const title = currentQuestionTitle();
-    log("Tìm thấy " + inputs.length + " ô điền | " + title);
+    log("Tìm thấy " + inputs.length + " ô điền | " + currentQuestionTitle());
 
     const stem = getStemText();
     const blankN = getTargetBlankNumber();
@@ -1535,7 +1599,7 @@
     const tfGroups = getTrueFalseGroups();
     const opts = getOptions();
 
-    if (tfGroups.length >= 2 || (tfGroups.length >= 1 && opts.type === "raw-radio")) {
+    if (tfGroups.length >= 1 && (tfGroups.length >= 2 || opts.type === "raw-radio")) {
       await stepTrueFalse(tfGroups, token);
       return;
     }
@@ -1567,11 +1631,12 @@
     if (running) return;
     running = true;
     const token = ++genToken;
-    setStatus("Đang chạy · " + getModel());
-    log("=== START · chọn: " + getModel() + " · dùng: " + (getWorkingModel() || "—") + " ===");
-    log("Model bị đánh dấu trả phí: " + (Array.from(getPaidSet()).join(", ") || "(không)"));
-    log("Key: " + (getUseKey() ? "ON" : "OFF (anon)") + " · Vision: " + (getVisionEnabled() ? "ON" : "OFF") +
-      " · Kiểm tra lại: " + getVerifyTimes() + " · Chu kỳ: " + getInterval() + "ms");
+    refreshStatus();
+    log("=== START · chọn: " + getModel() + " · working: " + (getWorkingModel() || "—") + " ===");
+    log("Paid: " + (Array.from(getPaidSet()).join(", ") || "(không)") +
+      " · NoVision: " + (Array.from(getNoVisionSet()).join(", ") || "(không)"));
+    log("Key: " + (getUseKey() ? "ON" : "OFF") + " · Vision: " + (getVisionEnabled() ? "ON" : "OFF") +
+      " · Số lần hỏi: " + getSamples() + " · Chu kỳ: " + getInterval() + "ms");
 
     while (running && token === genToken) {
       let timedOut = false;
@@ -1596,7 +1661,7 @@
     }
 
     running = false;
-    setStatus("Đã dừng");
+    refreshStatus();
     log("=== STOP ===");
   }
 
@@ -1605,10 +1670,10 @@
     loop();
   }
   function stop() {
-    if (!running) { setStatus("Đã dừng"); return; }
+    if (!running) { refreshStatus(); return; }
     running = false;
     genToken++;
-    setStatus("Đã dừng");
+    refreshStatus();
   }
 
   /* ============================ TEST / DEBUG ============================ */
@@ -1633,8 +1698,7 @@
     const tf = getTrueFalseGroups();
     log("Đúng/Sai: " + tf.length + " ý");
     tf.forEach((g, i) => {
-      log("  " + (g.label || String.fromCharCode(65 + i)) + ". " + (g.text || "(trống)").slice(0, 80) +
-        " [true=" + (g.trueRadio.id || "?") + " false=" + (g.falseRadio.id || "?") + "]");
+      log("  " + (g.label || String.fromCharCode(65 + i)) + ". " + (g.text || "(trống)").slice(0, 80));
     });
 
     const opts = getOptions();
@@ -1645,12 +1709,14 @@
 
     const fills = getFillInputs();
     log("Fill inputs: " + fills.length);
-    fills.forEach((el, i) => log("  #" + (i + 1) + " id=" + (el.id || "?") + " type=" + (el.type || "?")));
 
     const essay = getEssayInput();
     log("Essay textarea: " + (essay ? "có (id=" + (essay.id || "?") + ")" : "không"));
-    log("Vision bật: " + (getVisionEnabled() ? "có" : "không") + " · ảnh đề: " + stemImages().length);
+    const si = stemImages();
+    log("Ảnh đề: " + si.length + (si.length ? " (" + Math.round(si.reduce((a, s) => a + imgBytes(s), 0) / 1024) + "KB)" : ""));
     log("Blank numbered: " + (getTargetBlankNumber() || "không"));
+    log("Paid: " + (Array.from(getPaidSet()).join(", ") || "(không)"));
+    log("NoVision: " + (Array.from(getNoVisionSet()).join(", ") || "(không)"));
 
     const sheet = qsa(".answer-sheet .option");
     if (sheet.length) {
@@ -1663,43 +1729,45 @@
 
   async function testAI() {
     log("=== TEST AI ===");
-    log("Model chọn: " + getModel());
-    log("Model đang dùng: " + (getWorkingModel() || "(chưa)"));
-    log("Bị đánh dấu trả phí: " + (Array.from(getPaidSet()).join(", ") || "(không)"));
-    log("Dùng key: " + (getUseKey() ? "ON" : "OFF (anon)"));
+    log("Model chọn: " + getModel() + " · working: " + (getWorkingModel() || "—"));
+    log("Paid: " + (Array.from(getPaidSet()).join(", ") || "(không)") +
+      " · NoVision: " + (Array.from(getNoVisionSet()).join(", ") || "(không)"));
 
     const msgs = [{ role: "user", content: 'Trả lời DUY NHẤT bằng JSON: {"answer":"B","reason":"test"}' }];
-
-    const probe = ["openai-fast", "openai", "mistral", "gemini", "qwen-coder", "nova-fast"]
-      .filter((v, i, a) => a.indexOf(v) === i);
+    const probe = ["openai-fast", "openai", "nova-fast", "openai-large", "mistral", "gemini", "qwen-coder"];
 
     for (const m of probe) {
+      if (isPaid(m)) { log("⏭ " + m + " (đã đánh dấu paid)"); continue; }
       for (const mode of [{ useKey: true, ep: 0 }, { useKey: false, ep: 0 }]) {
         const tag = (mode.useKey ? "key" : "anon") + "·ep" + mode.ep;
         log("… " + m + " (" + tag + ")");
         const r = await callModel(m, msgs, 20000, mode);
-        if (r.ok) log("✅ " + m + " (" + tag + ") OK → " + r.text.slice(0, 90));
-        else if (r.paid) log("💳 " + m + " (" + tag + ") CẦN TRẢ PHÍ.");
+        if (r.ok) log("✅ " + m + " (" + tag + ") OK");
+        else if (r.paid) { markPaid(m); log("💳 " + m + " (" + tag + ") CẦN TRẢ PHÍ."); }
         else log("✗ " + m + " (" + tag + ") → " + String(r.err || ("status " + r.status)).slice(0, 110));
       }
     }
 
     log("=== TEST VISION ===");
-    const tiny = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+    // ảnh thật: 2x2 đỏ để phân biệt model có "nhìn" được hay không
+    const redPng = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFElEQVR42mP8z8Dwn4GBgYGJAQoAHgQCAQ+qyT0AAAAASUVORK5CYII=";
     const vmsgs = [{
       role: "user",
       content: [
-        { type: "text", text: 'Ảnh này là gì? Trả lời JSON: {"answer":"A","reason":"..."}' },
-        { type: "image_url", image_url: { url: tiny } }
+        { type: "text", text: 'Ảnh đính kèm có màu gì? Trả lời JSON: {"answer":"A","reason":"màu ..."}' },
+        { type: "image_url", image_url: { url: redPng } }
       ]
     }];
-    for (const m of ["gemini", "openai", "openai-fast", "mistral"]) {
+
+    for (const m of ["openai-fast", "openai-large", "openai", "gemini", "mistral"]) {
+      if (isPaid(m)) { log("⏭ vision " + m + " (đã đánh dấu paid)"); continue; }
       for (const mode of [{ useKey: true, ep: 0 }, { useKey: false, ep: 0 }]) {
         const tag = (mode.useKey ? "key" : "anon") + "·ep" + mode.ep;
         log("… [vision] " + m + " (" + tag + ")");
-        const r = await callModel(m, vmsgs, 25000, mode);
+        const r = await callModel(m, vmsgs, 25000, { ep: mode.ep, useKey: mode.useKey, vision: true });
         if (r.ok) log("✅ vision " + m + " (" + tag + ") OK → " + r.text.slice(0, 90));
-        else if (r.paid) log("💳 vision " + m + " (" + tag + ") CẦN TRẢ PHÍ.");
+        else if (r.noVision) { markNoVision(m); log("🖼 vision " + m + " (" + tag + ") KHÔNG NHẬN ẢNH."); }
+        else if (r.paid) { markPaid(m); log("💳 vision " + m + " (" + tag + ") CẦN TRẢ PHÍ."); }
         else log("✗ vision " + m + " (" + tag + ") → " + String(r.err || ("status " + r.status)).slice(0, 110));
       }
     }
@@ -1722,7 +1790,7 @@
 
     wrap.innerHTML =
       '<div id="ais-head" style="display:flex;align-items:center;gap:8px;padding:8px 10px;background:linear-gradient(90deg,#134e2a,#1b7a3e);font-weight:700;cursor:move;user-select:none;">' +
-        '<span>⚡ ai slover v40.1</span><span style="flex:1"></span>' +
+        '<span>⚡ ai slover v40.2</span><span style="flex:1"></span>' +
         '<button id="ais-collapse" style="background:#0b2b17;color:#cfe8d5;border:1px solid #2e7d32;border-radius:5px;padding:0 7px;cursor:pointer;">–</button>' +
       '</div>' +
       '<div id="ais-body" style="padding:8px 10px 10px;">' +
@@ -1748,8 +1816,8 @@
         '<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">' +
           '<span style="width:78px;color:#9fb3c8;">Chu kỳ ms</span>' +
           '<input id="ais-interval" type="number" min="300" max="10000" step="100" style="width:80px;background:#151b22;color:#e8eaed;border:1px solid #2b3a47;border-radius:5px;padding:3px 5px;">' +
-          '<span style="color:#9fb3c8;">Kiểm tra</span>' +
-          '<input id="ais-verify" type="number" min="0" max="3" style="width:52px;background:#151b22;color:#e8eaed;border:1px solid #2b3a47;border-radius:5px;padding:3px 5px;">' +
+          '<span style="color:#9fb3c8;">Số lần hỏi</span>' +
+          '<input id="ais-verify" type="number" min="1" max="5" style="width:52px;background:#151b22;color:#e8eaed;border:1px solid #2b3a47;border-radius:5px;padding:3px 5px;">' +
         '</div>' +
 
         '<label style="display:flex;gap:6px;align-items:center;margin-bottom:4px;cursor:pointer;"><input id="ais-vision" type="checkbox"> 📷 Dùng AI đọc hình (vision)</label>' +
@@ -1770,13 +1838,13 @@
           '<button id="ais-dump" style="flex:1;background:#444;color:#fff;border:0;border-radius:6px;padding:5px;cursor:pointer;">🔬 Dump HTML</button>' +
         '</div>' +
         '<div style="display:flex;gap:6px;margin-bottom:6px;">' +
-          '<button id="ais-clearpaid" style="flex:1;background:#3a3a3a;color:#ddd;border:0;border-radius:6px;padding:4px;cursor:pointer;">♻ Xoá danh sách trả phí</button>' +
+          '<button id="ais-clearpaid" style="flex:1;background:#3a3a3a;color:#ddd;border:0;border-radius:6px;padding:4px;cursor:pointer;">♻ Xoá đánh dấu paid / no-vision</button>' +
         '</div>' +
 
         '<div id="ais-status" style="color:#9fb3c8;margin-bottom:4px;">Sẵn sàng</div>' +
         '<div id="ais-answer" style="background:#0b2b17;border:1px solid #2e7d32;border-radius:6px;padding:5px 7px;color:#8bf0a8;font-weight:700;margin-bottom:6px;min-height:16px;"></div>' +
         '<div id="ais-log" style="height:172px;overflow:auto;background:#080b0e;border:1px solid #1e2a33;border-radius:6px;padding:5px;font:11px/1.35 ui-monospace,Consolas,monospace;color:#b8c7d1;"></div>' +
-        '<div style="margin-top:6px;color:#5f7284;font-size:10.5px;">v40.1 · Đúng/Sai · Vision · model free fallback · chống treo 150s</div>' +
+        '<div style="margin-top:6px;color:#5f7284;font-size:10.5px;">v40.2 · bầu chọn đa số · vision cho Đúng/Sai · openai-fast đọc ảnh</div>' +
       '</div>';
 
     document.body.appendChild(wrap);
@@ -1799,7 +1867,7 @@
     document.getElementById("ais-custom").value = lsGet(MODEL_CUSTOM_KEY, "") || "";
     document.getElementById("ais-key").value = lsGet(APIKEY_KEY, "") || "";
     document.getElementById("ais-interval").value = getInterval();
-    document.getElementById("ais-verify").value = getVerifyTimes();
+    document.getElementById("ais-verify").value = getSamples();
     document.getElementById("ais-usekey").checked = getUseKey();
     document.getElementById("ais-vision").checked = getVisionEnabled();
     document.getElementById("ais-redo").checked = getRedo();
@@ -1810,12 +1878,14 @@
       lsSet(MODEL_CUSTOM_KEY, "");
       document.getElementById("ais-custom").value = "";
       log("Đổi model → " + sel.value);
+      refreshStatus();
     });
 
     document.getElementById("ais-custom").addEventListener("change", (e) => {
       const v = (e.target.value || "").trim();
       lsSet(MODEL_CUSTOM_KEY, v);
       log(v ? "Model khác → " + v : "Bỏ model khác.");
+      refreshStatus();
     });
 
     document.getElementById("ais-key").addEventListener("change", (e) => {
@@ -1842,7 +1912,7 @@
 
     document.getElementById("ais-verify").addEventListener("change", (e) => {
       const n = parseInt(e.target.value, 10);
-      lsSet(VERIFY_KEY, isNaN(n) ? 1 : Math.max(0, Math.min(3, n)));
+      lsSet(SAMPLES_KEY, isNaN(n) ? 3 : Math.max(1, Math.min(5, n)));
     });
 
     document.getElementById("ais-vision").addEventListener("change", (e) => lsSet(VISION_KEY, e.target.checked ? "1" : "0"));
@@ -1856,9 +1926,8 @@
     document.getElementById("ais-models").addEventListener("click", refreshModelList);
     document.getElementById("ais-dump").addEventListener("click", dumpHTML);
     document.getElementById("ais-clearpaid").addEventListener("click", () => {
-      clearPaid();
-      lsSet(COMBO_KEY, "");
-      log("♻ Đã xoá danh sách model trả phí + combo đã lưu.");
+      clearAllMarks();
+      log("♻ Đã xoá đánh dấu paid / no-vision / working combo.");
     });
 
     document.getElementById("ais-collapse").addEventListener("click", () => {
@@ -1895,13 +1964,29 @@
 
   /* ============================ BOOT ============================ */
   function boot() {
+    // migration: deepseek-v4-flash thành trả phí
+    const stored = (lsGet(MODEL_KEY, "") || "").trim();
+    const custom = (lsGet(MODEL_CUSTOM_KEY, "") || "").trim();
+    if (stored === "deepseek/deepseek-v4-flash" || custom === "deepseek/deepseek-v4-flash") {
+      lsSet(MODEL_KEY, DEFAULT_MODEL);
+      lsSet(MODEL_CUSTOM_KEY, "");
+      log("⚠ deepseek/deepseek-v4-flash đã thành trả phí → tự chuyển sang " + DEFAULT_MODEL);
+    }
+    if (isPaid(getModel())) {
+      log("⚠ Model đang chọn (" + getModel() + ") bị đánh dấu trả phí → chuyển sang " + DEFAULT_MODEL);
+      lsSet(MODEL_KEY, DEFAULT_MODEL);
+      lsSet(MODEL_CUSTOM_KEY, "");
+    }
+
     buildGui();
     log("VERSION " + VERSION_STR + " booted at " + new Date().toISOString());
     log("URL: " + location.href);
     log("qRoot: " + (qRoot() ? "có container" : "chưa thấy (trang đang tải)"));
     log("Model mặc định: " + DEFAULT_MODEL + " · đang chọn: " + getModel());
-    log("API key: " + (getUseKey() ? "ON" : "OFF (anon)"));
-    if (getPaidSet().size) log("⚠ Model bị đánh dấu trả phí: " + Array.from(getPaidSet()).join(", ") + " (bấm ♻ để xoá)");
+    log("API key: " + (getUseKey() ? "ON" : "OFF (anon)") + " · Số lần hỏi: " + getSamples());
+    if (getPaidSet().size) log("⚠ Paid: " + Array.from(getPaidSet()).join(", ") + " (bấm ♻ để xoá)");
+    if (getNoVisionSet().size) log("⚠ NoVision: " + Array.from(getNoVisionSet()).join(", ") + " (bấm ♻ để xoá)");
+    refreshStatus();
   }
 
   if (document.readyState === "loading") {
@@ -1917,6 +2002,7 @@
     test: testAI,
     models: refreshModelList,
     paid: () => Array.from(getPaidSet()),
-    clearPaid: clearPaid
+    noVision: () => Array.from(getNoVisionSet()),
+    clearMarks: clearAllMarks
   };
 })();
